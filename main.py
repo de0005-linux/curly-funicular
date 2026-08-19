@@ -4,6 +4,14 @@ import os
 import hashlib
 import secrets
 import time
+import sys
+
+# وقتی فایل با `python main.py` اجرا می‌شود نام ماژول `__main__` است. ماژول‌های
+# relay_vless/speed_limit از `main` import می‌کنند؛ بدون این alias پایتون فایل را
+# بار دوم اجرا می‌کرد و circular import قبل از تعریف RELAY_BUF باعث کرش می‌شد.
+if __name__ == "__main__":
+    sys.modules.setdefault("main", sys.modules[__name__])
+
 import aiofiles
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -272,8 +280,8 @@ def generate_vless_link(
         port_val = DEFAULT_PORT
 
     if protocol == "vless-ws":
-        # ed=4096: تا ۴KB از اولین داده داخل دست‌دادن WS می‌رود؛ بزرگ‌تر از این
-        # بعد از Base64 ممکن است از سقف هدر بعضی CDNها عبور کند.
+        # ed=4096 → تا ۴KB از اولین داده داخل خود دست‌دادن WebSocket می‌رود.
+        # مقدار بزرگ‌تر از این، بعد از Base64 ممکن است از سقف هدر بعضی CDNها رد شود.
         path = f"/ws/{uuid}?ed=4096"
         params = {
             "encryption": "none",
@@ -1192,12 +1200,18 @@ if __name__ == "__main__":
         _http = "httptools"
     except Exception:
         pass
+
+    # Uvicorn 0.52.4 + websockets 17 Sans-I/O: بدون کپی payload تک‌فریمی.
+    # پروتکل سفارشی ما queue را burst می‌کند و دو رفت‌وبرگشت ASGI را از هر فریم حذف می‌کند.
     try:
         from turbo_ws_protocol import TurboWebSocketsSansIOProtocol
         _ws_protocol = TurboWebSocketsSansIOProtocol
     except Exception as _ws_import_error:
+        # اگر محیط هنوز dependencyهای قبلی را cache کرده، سرویس بالا می‌آید و به
+        # انتخاب خودکار Uvicorn برمی‌گردد؛ فقط fast path غیرفعال می‌شود.
         _ws_protocol = "auto"
         logger.warning("WS turbo protocol unavailable: %s", _ws_import_error)
+
     # سوکت listen را خودمان می‌سازیم تا بتوانیم بافرها و کنترل ازدحام را روی آن تنظیم کنیم؛
     # هر اتصال WebSocket پذیرفته‌شده این تنظیمات را ارث می‌برد → مسیر دانلود به کلاینت پهن می‌شود.
     import socket as _socket
@@ -1209,14 +1223,19 @@ if __name__ == "__main__":
         _listen_sock.bind(("0.0.0.0", CONFIG["port"]))
         _listen_sock.listen(8192)
         _listen_sock.set_inheritable(True)
+        # Best effort: TFO و DEFER_ACCEPT فقط روی لینوکس/کرنل مجاز اعمال می‌شوند.
         _tfo = getattr(_socket, "TCP_FASTOPEN", None)
         if _tfo is not None:
-            try: _listen_sock.setsockopt(_socket.IPPROTO_TCP, _tfo, 4096)
-            except OSError: pass
+            try:
+                _listen_sock.setsockopt(_socket.IPPROTO_TCP, _tfo, 4096)
+            except OSError:
+                pass
         _defer = getattr(_socket, "TCP_DEFER_ACCEPT", None)
         if _defer is not None:
-            try: _listen_sock.setsockopt(_socket.IPPROTO_TCP, _defer, 1)
-            except OSError: pass
+            try:
+                _listen_sock.setsockopt(_socket.IPPROTO_TCP, _defer, 1)
+            except OSError:
+                pass
         for _opt, _val in (
             (_socket.SO_SNDBUF, 16 * 1024 * 1024),
             (_socket.SO_RCVBUF, 16 * 1024 * 1024),

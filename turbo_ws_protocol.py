@@ -1,14 +1,13 @@
-"""High-throughput Uvicorn WebSocket protocol for bulk VLESS traffic.
+"""Uvicorn WebSocket data-plane tuned for bulk VLESS/WS transfers.
 
-Pinned to Uvicorn 0.52.4. It keeps the standards-compliant websockets Sans-I/O
-parser for client frames, while removing three hot-path costs:
-1) pause/resume of socket reading after every message;
-2) Starlette/ASGI dict round-trips for each binary message;
-3) BytesIO serialization that copies every server-to-client payload.
+This module deliberately stays on Uvicorn's supported Sans-I/O WebSocket engine;
+it only changes queue watermarks, accepted-socket tuning, and exposes two small
+fast-path methods that avoid the Starlette/ASGI dictionary hop for each binary
+message.  All framing, masking validation, close handling and protocol state
+remain owned by ``websockets``.
 
-The direct sender is used only with per-message compression disabled. Frames are
-standard FIN+binary, unmasked server frames. Control and close frames remain
-owned by the Sans-I/O state machine.
+The implementation is pinned to Uvicorn 0.52.4 in requirements.txt.  If this
+module cannot be imported, main.py falls back to Uvicorn's stock protocol.
 """
 
 from __future__ import annotations
@@ -16,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
-import struct
 from typing import Any
 
 from uvicorn.protocols.utils import ClientDisconnected
-from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
+from uvicorn.protocols.websockets.websockets_sansio_impl import (
+    WebSocketsSansIOProtocol,
+)
+from websockets.exceptions import InvalidState
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -31,8 +32,12 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+# A stock Uvicorn Sans-I/O connection pauses transport reading after *every*
+# complete message. Xray sends many binary messages while downloading/uploading;
+# pause/resume on each one becomes an avoidable syscall/event-loop bottleneck.
 RX_QUEUE_HIGH = _env_int("WS_TURBO_QUEUE_HIGH", 128, 8, 1024)
 RX_QUEUE_LOW = _env_int("WS_TURBO_QUEUE_LOW", 32, 1, RX_QUEUE_HIGH - 1)
+
 SOCKET_BUFFER = _env_int(
     "WS_TURBO_SOCKET_BUFFER", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024
 )
@@ -47,16 +52,19 @@ PREFERRED_CC = (b"bbr", b"cubic")
 
 
 def _tune_accepted_socket(transport: asyncio.Transport) -> None:
+    """Tune the actual accepted client socket, not merely the listen socket."""
     try:
         transport.set_write_buffer_limits(high=WRITE_BUFFER_HIGH, low=WRITE_BUFFER_LOW)
     except Exception:
         pass
+
     try:
         sock = transport.get_extra_info("socket")
     except Exception:
         sock = None
     if sock is None:
         return
+
     for level, option, value in (
         (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
         (socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER),
@@ -66,12 +74,14 @@ def _tune_accepted_socket(transport: asyncio.Transport) -> None:
             sock.setsockopt(level, option, value)
         except OSError:
             pass
+
     quickack = getattr(socket, "TCP_QUICKACK", None)
     if quickack is not None:
         try:
             sock.setsockopt(socket.IPPROTO_TCP, quickack, 1)
         except OSError:
             pass
+
     congestion = getattr(socket, "TCP_CONGESTION", None)
     if congestion is not None:
         for algorithm in PREFERRED_CC:
@@ -80,32 +90,35 @@ def _tune_accepted_socket(transport: asyncio.Transport) -> None:
                 break
             except OSError:
                 continue
+
+    # Low-delay DSCP hint; unsupported/container-restricted kernels simply ignore it.
     try:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)
     except OSError:
         pass
 
 
-def _binary_header(length: int) -> bytes:
-    if length < 126:
-        return bytes((0x82, length))
-    if length < 65536:
-        return struct.pack("!BBH", 0x82, 126, length)
-    return struct.pack("!BBQ", 0x82, 127, length)
-
-
 class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
-    """Sans-I/O protocol with bounded burst queueing and a no-full-copy sender."""
+    """Sans-I/O WebSocket protocol with bulk-transfer queueing and fast I/O hooks."""
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         super().connection_made(transport)
         _tune_accepted_socket(self.transport)
 
     def send_receive_event_to_app(self) -> None:
+        """Queue bursts and pause only at a real high-water mark.
+
+        Uvicorn 0.52.4's stock implementation pauses socket reading for every
+        individual message. Here, up to ``RX_QUEUE_HIGH`` complete messages may
+        be queued. This preserves bounded backpressure while removing thousands
+        of pause/resume transitions during a large transfer.
+        """
         data = self.frames[0] if len(self.frames) == 1 else b"".join(self.frames)
         self.frames = []
+
         if self.close_sent:
             return
+
         if self.curr_msg_data_type == "text":
             try:
                 message = {"type": "websocket.receive", "text": data.decode()}
@@ -115,7 +128,10 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
                 self.handle_parser_exception()
                 return
         else:
+            # Keep the single-frame object unchanged. websockets/Uvicorn 0.50+
+            # specifically avoids copying this payload.
             message = {"type": "websocket.receive", "bytes": data}
+
         self.queue.put_nowait(message)  # type: ignore[arg-type]
         if not self.read_paused and self.queue.qsize() >= RX_QUEUE_HIGH:
             self.read_paused = True
@@ -129,14 +145,15 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
         return message
 
     async def turbo_receive(self):
+        """Direct receive hook used by relay_vless after Starlette accepted WS."""
         return await self.receive()
 
     async def turbo_send_bytes(self, data: bytes | bytearray | memoryview) -> None:
-        """Write an uncompressed server binary frame as header + payload pieces.
+        """Send one official Sans-I/O binary frame without the ASGI dict hop.
 
-        No await occurs between the two transport writes, so control frames cannot
-        interleave. If compression is ever enabled, fall back to the official
-        Sans-I/O serializer because RSV1 and extension state would be required.
+        This does not handcraft WebSocket frames. ``websockets`` still validates
+        protocol state and serializes the frame; we only avoid Starlette and
+        Uvicorn unpacking/repacking an ASGI message for every payload.
         """
         if not self.writable.is_set():
             await self.writable.wait()
@@ -148,14 +165,19 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
         ):
             raise ClientDisconnected()
 
-        if self.config.ws_per_message_deflate:
-            await self.send({"type": "websocket.send", "bytes": bytes(data)})
-            return
+        try:
+            self.conn.send_binary(data)
+            output = self.conn.data_to_send()
+        except InvalidState as exc:
+            raise ClientDisconnected() from exc
 
-        self.transport.write(_binary_header(len(data)))
-        self.transport.write(data)
+        # Keep buffers separate when Sans-I/O returns header + payload pieces;
+        # b''.join(...) would create a full-size duplicate of a multi-MB frame.
+        for part in output:
+            self.transport.write(part)
 
     async def turbo_flush(self) -> None:
+        """Wait until transport backpressure has dropped below its low watermark."""
         if not self.writable.is_set() and not self.disconnected:
             await self.writable.wait()
 
