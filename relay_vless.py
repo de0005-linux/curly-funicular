@@ -1,0 +1,593 @@
+# relay_vless.py
+# VLESS-over-WebSocket relay — Hyper data plane
+# Standard VLESS/Xray framing is unchanged; optimizations are server-side only.
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import secrets
+import socket
+import time
+from datetime import datetime
+from typing import Any
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+from main import (
+    LINKS, LINKS_LOCK, stats, hourly_traffic, connections, error_logs, logger,
+    is_link_allowed, is_ip_allowed, save_state, log_activity, now_ir,
+)
+from speed_limit import QuotaGate, throttle
+
+READ_MIN = 128 * 1024
+READ_MAX = 8 * 1024 * 1024
+READ_START = 1024 * 1024
+STREAM_LIMIT = 16 * 1024 * 1024
+BULK_TRIGGER = 128 * 1024
+BULK_STREAK_TRIGGER = 2
+WRITE_HW_MIN = 512 * 1024
+WRITE_HW_MAX = 32 * 1024 * 1024
+WRITE_HW_START = 4 * 1024 * 1024
+FLOW_FAST_DRAIN_MS = 2.0
+FLOW_SLOW_DRAIN_MS = 30.0
+SOCK_BUF_SIZE = 16 * 1024 * 1024
+PREFERRED_CC = (b"bbr", b"cubic")
+CONNECT_TIMEOUT = 10.0
+HEADER_TIMEOUT = 15.0
+HEADER_MAX = 16 * 1024
+PARALLEL_CONNECT = 4
+MIN_PARALLEL_CONNECT = 2
+CONNECT_STAGGER = 0.06
+DNS_TTL = 300.0
+ROUTE_TTL = 900.0
+DNS_CACHE_MAX = 4096
+RELAY_BUF = READ_START
+
+_dns_cache: dict[tuple[str, int], tuple[float, list[tuple[int, tuple]]]] = {}
+_dns_inflight: dict[tuple[str, int], asyncio.Task] = {}
+_route_cache: dict[tuple[str, int], tuple[float, int, tuple]] = {}
+
+
+class _AdaptiveFlow:
+    __slots__ = ("high_water",)
+
+    def __init__(self) -> None:
+        self.high_water = WRITE_HW_START
+
+    def observe(self, drain_ms: float, transport: asyncio.BaseTransport) -> None:
+        if drain_ms <= FLOW_FAST_DRAIN_MS:
+            self.high_water = min(int(self.high_water * 1.5) + 65536, WRITE_HW_MAX)
+        elif drain_ms >= FLOW_SLOW_DRAIN_MS:
+            self.high_water = max(self.high_water // 2, WRITE_HW_MIN)
+        try:
+            transport.set_write_buffer_limits(
+                high=self.high_water, low=max(self.high_water // 4, 65536)
+            )
+        except Exception:
+            pass
+
+
+class _WSIO:
+    """Use custom Uvicorn fast hooks when present; otherwise use Starlette."""
+    __slots__ = ("ws", "protocol", "_receive", "_send", "_flush")
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self.protocol = _ws_protocol_owner(ws)
+        self._receive = getattr(self.protocol, "turbo_receive", None)
+        self._send = getattr(self.protocol, "turbo_send_bytes", None)
+        self._flush = getattr(self.protocol, "turbo_flush", None)
+
+    async def receive(self) -> dict:
+        if self._receive is not None:
+            return await self._receive()
+        return await self.ws.receive()
+
+    async def send_bytes(self, data: bytes | bytearray | memoryview) -> None:
+        if self._send is not None:
+            await self._send(data)
+            return
+        if not isinstance(data, bytes):
+            data = bytes(data)
+        await self.ws.send_bytes(data)
+
+    async def flush(self) -> None:
+        if self._flush is not None:
+            await self._flush()
+
+
+def _ws_protocol_owner(ws: WebSocket) -> Any | None:
+    for attr in ("_send", "_receive"):
+        owner = getattr(getattr(ws, attr, None), "__self__", None)
+        if owner is not None and hasattr(owner, "transport"):
+            return owner
+    return None
+
+
+def _ws_client_ip(ws: WebSocket) -> str:
+    fwd = ws.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    real_ip = ws.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    client = getattr(ws, "client", None)
+    return client.host if client else "نامشخص"
+
+
+def _early_data(ws: WebSocket) -> bytes:
+    raw = ws.headers.get("sec-websocket-protocol")
+    if not raw:
+        return b""
+    token = raw.split(",", 1)[0].strip()
+    if not token or len(token) > ((HEADER_MAX * 4 + 2) // 3):
+        return b""
+    try:
+        return base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    except Exception:
+        return b""
+
+
+def _set_common_tcp_options(sock: socket.socket) -> None:
+    for level, option, value in (
+        (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+        (socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF_SIZE),
+        (socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF_SIZE),
+    ):
+        try:
+            sock.setsockopt(level, option, value)
+        except OSError:
+            pass
+    quickack = getattr(socket, "TCP_QUICKACK", None)
+    if quickack is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, quickack, 1)
+        except OSError:
+            pass
+    congestion = getattr(socket, "TCP_CONGESTION", None)
+    if congestion is not None:
+        for algorithm in PREFERRED_CC:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, congestion, algorithm)
+                break
+            except OSError:
+                continue
+    # A fixed low TCP_NOTSENT_LOWAT was intentionally removed: it can cap
+    # throughput on high-bandwidth/high-RTT paths by keeping too little in flight.
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)
+    except OSError:
+        pass
+
+
+def _tune_socket(writer: asyncio.StreamWriter, high_water: int) -> None:
+    transport = writer.transport
+    try:
+        sock = transport.get_extra_info("socket")
+    except Exception:
+        sock = None
+    if sock is not None:
+        _set_common_tcp_options(sock)
+    try:
+        transport.set_write_buffer_limits(high=high_water, low=max(high_water // 4, 65536))
+    except Exception:
+        pass
+
+
+def _tune_client_socket(ws: WebSocket) -> None:
+    protocol = _ws_protocol_owner(ws)
+    transport = getattr(protocol, "transport", None)
+    sock = None
+    if transport is not None:
+        try:
+            sock = transport.get_extra_info("socket")
+            transport.set_write_buffer_limits(high=8 * 1024 * 1024, low=1024 * 1024)
+        except Exception:
+            sock = None
+    if sock is None:
+        try:
+            transport = (getattr(ws, "scope", {}) or {}).get("transport")
+            if transport is not None:
+                sock = transport.get_extra_info("socket")
+        except Exception:
+            sock = None
+    if sock is not None:
+        _set_common_tcp_options(sock)
+
+
+def _numeric_address(host: str, port: int) -> list[tuple[int, tuple]] | None:
+    bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        socket.inet_pton(socket.AF_INET, bare)
+        return [(socket.AF_INET, (bare, port))]
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, bare)
+        return [(socket.AF_INET6, (bare, port, 0, 0))]
+    except OSError:
+        return None
+
+
+async def _do_resolve(host: str, port: int) -> list[tuple[int, tuple]]:
+    numeric = _numeric_address(host, port)
+    if numeric is not None:
+        return numeric
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    result, seen = [], set()
+    for family, _socktype, _proto, _canonname, sockaddr in infos:
+        identity = (family, sockaddr)
+        if identity not in seen:
+            seen.add(identity)
+            result.append((family, sockaddr))
+    result.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+    return result
+
+
+async def _resolve(host: str, port: int) -> list[tuple[int, tuple]]:
+    key, now = (host, port), time.monotonic()
+    hit = _dns_cache.get(key)
+    if hit and hit[0] > now:
+        result = list(hit[1])
+    else:
+        task = _dns_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(_do_resolve(host, port))
+            _dns_inflight[key] = task
+        try:
+            result = list(await asyncio.shield(task))
+        finally:
+            if _dns_inflight.get(key) is task and task.done():
+                _dns_inflight.pop(key, None)
+        if len(_dns_cache) >= DNS_CACHE_MAX:
+            _dns_cache.clear()
+            _route_cache.clear()
+        _dns_cache[key] = (now + DNS_TTL, list(result))
+    preferred = _route_cache.get(key)
+    if preferred and preferred[0] > now:
+        candidate = (preferred[1], preferred[2])
+        try:
+            result.remove(candidate)
+        except ValueError:
+            pass
+        result.insert(0, candidate)
+    return result
+
+
+async def _open_upstream(address: str, port: int):
+    try:
+        addresses = await _resolve(address, port)
+    except Exception:
+        addresses = []
+    if not addresses:
+        return await asyncio.wait_for(
+            asyncio.open_connection(address, port, limit=STREAM_LIMIT), CONNECT_TIMEOUT
+        )
+    candidates = addresses[:PARALLEL_CONNECT]
+    while len(candidates) < MIN_PARALLEL_CONNECT:
+        candidates.append(candidates[0])
+
+    async def attempt(index: int, family: int, sockaddr: tuple):
+        if index:
+            await asyncio.sleep(CONNECT_STAGGER * index)
+        reader, writer = await asyncio.open_connection(
+            host=sockaddr[0], port=sockaddr[1], family=family, limit=STREAM_LIMIT
+        )
+        return reader, writer, family, sockaddr
+
+    pending = {
+        asyncio.create_task(attempt(i, family, sockaddr))
+        for i, (family, sockaddr) in enumerate(candidates)
+    }
+    winner, last_error = None, None
+    deadline = time.monotonic() + CONNECT_TIMEOUT
+    try:
+        while pending and winner is None:
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=max(deadline - time.monotonic(), 0.01),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError
+            for task in done:
+                try:
+                    result = task.result()
+                except Exception as exc:
+                    last_error = exc
+                    continue
+                if winner is None:
+                    winner = result
+                else:
+                    result[1].close()
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            for result in results:
+                if isinstance(result, tuple):
+                    try:
+                        result[1].close()
+                    except Exception:
+                        pass
+    if winner is None:
+        raise last_error or OSError(f"connect failed: {address}:{port}")
+    reader, writer, family, sockaddr = winner
+    _route_cache[(address, port)] = (time.monotonic() + ROUTE_TTL, family, sockaddr)
+    return reader, writer
+
+
+def _parse_vless_header(chunk: bytes | bytearray | memoryview):
+    view, length = memoryview(chunk), len(chunk)
+    if length < 19:
+        raise ValueError("incomplete vless prefix")
+    pos = 17
+    addon_len = view[pos]
+    pos += 1
+    if length < pos + addon_len + 4:
+        raise ValueError("incomplete vless options")
+    pos += addon_len
+    command = view[pos]
+    pos += 1
+    if command != 1:
+        raise ValueError(f"unsupported vless command: {command}")
+    port = int.from_bytes(view[pos:pos + 2], "big")
+    pos += 2
+    if port == 0:
+        raise ValueError("invalid destination port")
+    addr_type = view[pos]
+    pos += 1
+    if addr_type == 1:
+        if length < pos + 4:
+            raise ValueError("incomplete ipv4")
+        address = socket.inet_ntop(socket.AF_INET, view[pos:pos + 4])
+        pos += 4
+    elif addr_type == 2:
+        if length < pos + 1:
+            raise ValueError("incomplete domain length")
+        domain_len = view[pos]
+        pos += 1
+        if domain_len == 0 or length < pos + domain_len:
+            raise ValueError("incomplete domain")
+        address = bytes(view[pos:pos + domain_len]).decode("idna")
+        pos += domain_len
+    elif addr_type == 3:
+        if length < pos + 16:
+            raise ValueError("incomplete ipv6")
+        address = socket.inet_ntop(socket.AF_INET6, view[pos:pos + 16])
+        pos += 16
+    else:
+        raise ValueError(f"unknown address type: {addr_type}")
+    return command, address, port, bytes(view[pos:])
+
+
+async def parse_vless_header(chunk: bytes | bytearray | memoryview):
+    return _parse_vless_header(chunk)
+
+
+async def check_and_use(uid: str, nbytes: int) -> bool:
+    if nbytes <= 0:
+        return True
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None or not is_link_allowed(link):
+            return False
+        link["used_bytes"] = int(link.get("used_bytes", 0) or 0) + nbytes
+        stats["total_bytes"] = int(stats.get("total_bytes", 0) or 0) + nbytes
+        hourly_traffic[now_ir().strftime("%H:00")] += nbytes
+    return True
+
+
+def _speed_limited(uid: str) -> bool:
+    link = LINKS.get(uid)
+    return bool(link and int(link.get("speed_limit_bytes", 0) or 0) > 0)
+
+
+async def _account(gate: QuotaGate, nbytes: int) -> bool:
+    stage, commit = getattr(gate, "stage", None), getattr(gate, "commit", None)
+    if stage is None or commit is None:
+        return await gate.add(nbytes)
+    amount = stage(nbytes)
+    if amount < 0:
+        return False
+    return await commit(amount) if amount else True
+
+
+async def relay_ws_to_tcp(ws, writer, conn_id, uid, io: _WSIO | None = None):
+    io, gate = io or _WSIO(ws), QuotaGate(uid, check_and_use)
+    conn, flow = connections.get(conn_id), _AdaptiveFlow()
+    limited, transport, ticks = _speed_limited(uid), writer.transport, 0
+    try:
+        while True:
+            message = await io.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            data = message.get("bytes")
+            if data is None:
+                text = message.get("text")
+                data = text.encode() if text else None
+            if not data:
+                continue
+            nbytes = len(data)
+            if not await _account(gate, nbytes):
+                await ws.close(code=1008, reason="quota/disabled/unknown")
+                break
+            ticks += 1
+            if not (ticks & 127):
+                limited = _speed_limited(uid)
+            if limited:
+                await throttle(uid, nbytes)
+            if conn is not None:
+                conn["bytes"] += nbytes
+            writer.write(data)
+            if transport.get_write_buffer_size() >= flow.high_water:
+                started = time.monotonic()
+                await writer.drain()
+                flow.observe((time.monotonic() - started) * 1000.0, transport)
+    except (WebSocketDisconnect, ConnectionError, OSError):
+        pass
+    finally:
+        try:
+            await gate.flush()
+        except Exception:
+            pass
+        try:
+            writer.write_eof()
+        except Exception:
+            pass
+
+
+async def _read_stream_chunk(reader, max_bytes: int, coalesce_one_turn: bool):
+    """Detach StreamReader's entire bytearray when possible to avoid one copy."""
+    buffer = getattr(reader, "_buffer", None)
+    wait_for_data = getattr(reader, "_wait_for_data", None)
+    maybe_resume = getattr(reader, "_maybe_resume_transport", None)
+    if not isinstance(buffer, bytearray) or not callable(wait_for_data):
+        return await reader.read(max_bytes)
+    if getattr(reader, "_exception", None) is not None:
+        raise reader._exception
+    if not buffer and not getattr(reader, "_eof", False):
+        await wait_for_data("turbo-read")
+    if coalesce_one_turn and len(reader._buffer) < READ_MIN and not reader._eof:
+        await asyncio.sleep(0)
+    buffer = reader._buffer
+    if not buffer:
+        return b""
+    count = min(len(buffer), max_bytes)
+    if count == len(buffer):
+        data = buffer
+        reader._buffer = bytearray()
+    else:
+        data = bytes(memoryview(buffer)[:count])
+        del buffer[:count]
+    if callable(maybe_resume):
+        maybe_resume()
+    return data
+
+
+async def relay_tcp_to_ws(ws, reader, conn_id, uid, io: _WSIO | None = None):
+    io, gate = io or _WSIO(ws), QuotaGate(uid, check_and_use)
+    conn, limited, ticks, bulk_streak = connections.get(conn_id), _speed_limited(uid), 0, 0
+    try:
+        await io.send_bytes(b"\x00\x00")
+        while True:
+            data = await _read_stream_chunk(reader, READ_MAX, bulk_streak >= BULK_STREAK_TRIGGER)
+            if not data:
+                break
+            nbytes = len(data)
+            if nbytes >= BULK_TRIGGER:
+                bulk_streak = min(bulk_streak + 1, BULK_STREAK_TRIGGER + 2)
+            elif nbytes < READ_MIN // 4:
+                bulk_streak = max(bulk_streak - 1, 0)
+            if not await _account(gate, nbytes):
+                await ws.close(code=1008, reason="quota/disabled/unknown")
+                break
+            ticks += 1
+            if not (ticks & 127):
+                limited = _speed_limited(uid)
+            if limited:
+                await throttle(uid, nbytes)
+            if conn is not None:
+                conn["bytes"] += nbytes
+            await io.send_bytes(data)
+    except (WebSocketDisconnect, ConnectionError, OSError):
+        pass
+    finally:
+        try:
+            await gate.flush()
+        except Exception:
+            pass
+        try:
+            await io.flush()
+        except Exception:
+            pass
+
+
+async def _collect_header(io: _WSIO, early: bytes):
+    buffer = bytearray(early)
+    while True:
+        if len(buffer) >= 19:
+            try:
+                return (*_parse_vless_header(buffer), len(buffer))
+            except ValueError:
+                pass
+        if len(buffer) >= HEADER_MAX:
+            raise ValueError("vless header too large or invalid")
+        message = await asyncio.wait_for(io.receive(), timeout=HEADER_TIMEOUT)
+        if message["type"] == "websocket.disconnect":
+            raise WebSocketDisconnect(1006)
+        chunk = message.get("bytes")
+        if chunk is None:
+            text = message.get("text")
+            chunk = text.encode() if text else b""
+        if chunk:
+            buffer.extend(chunk)
+
+
+async def websocket_tunnel(ws: WebSocket, uuid: str):
+    early = _early_data(ws)
+    await ws.accept()
+    _tune_client_socket(ws)
+    io = _WSIO(ws)
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+    if not is_link_allowed(link):
+        logger.warning("WS rejected uuid=%s…", uuid[:8])
+        await ws.close(code=1008, reason="not authorized")
+        return
+    ip = _ws_client_ip(ws)
+    if not is_ip_allowed(link, uuid, ip):
+        log_activity("connection", f"اتصال {ip} رد شد (محدودیت تعداد آی‌پی)", "warn")
+        await ws.close(code=1008, reason="ip limit reached")
+        return
+    conn_id = secrets.token_urlsafe(6)
+    connections[conn_id] = {
+        "uuid": uuid, "ip": ip, "transport": "vless-ws-hyper",
+        "connected_at": datetime.now().isoformat(), "bytes": 0,
+    }
+    logger.info("WS [%s] uuid=%s… ip=%s ed=%dB", conn_id, uuid[:8], ip, len(early))
+    writer = None
+    try:
+        _command, address, port, payload, header_bytes = await _collect_header(io, early)
+        if not await check_and_use(uuid, header_bytes):
+            await ws.close(code=1008, reason="quota/disabled")
+            return
+        stats["total_requests"] = int(stats.get("total_requests", 0) or 0) + 1
+        connections[conn_id]["bytes"] += header_bytes
+        reader, writer = await _open_upstream(address, port)
+        _tune_socket(writer, WRITE_HW_START)
+        if payload:
+            writer.write(payload)
+        upload = asyncio.create_task(relay_ws_to_tcp(ws, writer, conn_id, uuid, io))
+        download = asyncio.create_task(relay_tcp_to_ws(ws, reader, conn_id, uuid, io))
+        done, pending = await asyncio.wait({upload, download}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            error = task.exception()
+            if error is not None:
+                raise error
+        await io.flush()
+        asyncio.create_task(save_state())
+    except WebSocketDisconnect:
+        pass
+    except asyncio.TimeoutError:
+        stats["total_errors"] = int(stats.get("total_errors", 0) or 0) + 1
+        error_logs.append({"error": "connection timeout", "time": datetime.now().isoformat()})
+    except Exception as exc:
+        stats["total_errors"] = int(stats.get("total_errors", 0) or 0) + 1
+        error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
+        logger.error("WS error [%s]: %s", conn_id, exc)
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), 2.0)
+            except Exception:
+                pass
+        connections.pop(conn_id, None)
+        logger.info("WS closed [%s] total=%d", conn_id, len(connections))
