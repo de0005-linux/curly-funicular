@@ -38,27 +38,29 @@ from speed_limit import QuotaGate, throttle
 READ_MIN = 128 * 1024
 READ_MAX = 8 * 1024 * 1024
 READ_START = 1024 * 1024
-STREAM_LIMIT = 16 * 1024 * 1024
+STREAM_LIMIT = 32 * 1024 * 1024
 BULK_TRIGGER = 128 * 1024
 BULK_STREAK_TRIGGER = 2
 
 WRITE_HW_MIN = 512 * 1024
-WRITE_HW_MAX = 32 * 1024 * 1024
-WRITE_HW_START = 4 * 1024 * 1024
+WRITE_HW_MAX = 64 * 1024 * 1024
+WRITE_HW_START = 8 * 1024 * 1024
 FLOW_FAST_DRAIN_MS = 2.0
 FLOW_SLOW_DRAIN_MS = 30.0
 
-SOCK_BUF_SIZE = 16 * 1024 * 1024
+SOCK_BUF_SIZE = 32 * 1024 * 1024
 PREFERRED_CC = (b"bbr", b"cubic")
 CONNECT_TIMEOUT = 10.0
 HEADER_TIMEOUT = 15.0
 HEADER_MAX = 16 * 1024
 
-PARALLEL_CONNECT = 4
-MIN_PARALLEL_CONNECT = 2
-CONNECT_STAGGER = 0.06
+PARALLEL_CONNECT = 6
+DUAL_STACK_DELAY = 0.0          # first IPv6 and first IPv4 start together
+ADDITIONAL_CONNECT_STAGGER = 0.05
 DNS_TTL = 300.0
-ROUTE_TTL = 900.0
+ROUTE_TTL = 1800.0
+ROUTE_FAILURE_BASE = 10.0
+ROUTE_FAILURE_MAX = 300.0
 DNS_CACHE_MAX = 4096
 
 # Backwards-compatible export used by main.py and older integrations.
@@ -67,6 +69,7 @@ RELAY_BUF = READ_START
 _dns_cache: dict[tuple[str, int], tuple[float, list[tuple[int, tuple]]]] = {}
 _dns_inflight: dict[tuple[str, int], asyncio.Task] = {}
 _route_cache: dict[tuple[str, int], tuple[float, int, tuple]] = {}
+_route_health: dict[tuple, tuple[float, int, float]] = {}
 
 
 class _AdaptiveFlow:
@@ -193,6 +196,13 @@ def _set_common_tcp_options(sock: socket.socket) -> None:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)
     except OSError:
         pass
+    # Equivalent low-delay traffic class for native IPv6 sockets.
+    ipv6_tclass = getattr(socket, "IPV6_TCLASS", None)
+    if ipv6_tclass is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, ipv6_tclass, 0x10)
+        except OSError:
+            pass
 
 
 def _tune_socket(writer: asyncio.StreamWriter, high_water: int) -> None:
@@ -220,7 +230,7 @@ def _tune_client_socket(ws: WebSocket) -> None:
         try:
             sock = transport.get_extra_info("socket")
             transport.set_write_buffer_limits(
-                high=8 * 1024 * 1024, low=1024 * 1024
+                high=16 * 1024 * 1024, low=2 * 1024 * 1024
             )
         except Exception:
             sock = None
@@ -237,19 +247,35 @@ def _tune_client_socket(ws: WebSocket) -> None:
         _set_common_tcp_options(sock)
 
 
-# ── DNS + raced upstream connection ─────────────────────────────────────────
+# ── Adaptive dual-stack DNS + raced upstream connection ─────────────────────
 def _numeric_address(host: str, port: int) -> list[tuple[int, tuple]] | None:
     bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    # Strip an RFC 4007 zone id only for inet_pton; preserve scope via getaddrinfo.
+    plain = bare.split("%", 1)[0]
     try:
-        socket.inet_pton(socket.AF_INET, bare)
-        return [(socket.AF_INET, (bare, port))]
+        socket.inet_pton(socket.AF_INET, plain)
+        return [(socket.AF_INET, (plain, port))]
     except OSError:
         pass
     try:
-        socket.inet_pton(socket.AF_INET6, bare)
-        return [(socket.AF_INET6, (bare, port, 0, 0))]
+        socket.inet_pton(socket.AF_INET6, plain)
+        if "%" in bare:
+            try:
+                infos = socket.getaddrinfo(
+                    bare, port, socket.AF_INET6, socket.SOCK_STREAM
+                )
+                return [(socket.AF_INET6, infos[0][4])]
+            except OSError:
+                pass
+        return [(socket.AF_INET6, (plain, port, 0, 0))]
     except OSError:
         return None
+
+
+def _sockaddr_identity(family: int, sockaddr: tuple) -> tuple:
+    # flowinfo is route metadata; address, port and scope identify an endpoint.
+    scope = sockaddr[3] if family == socket.AF_INET6 and len(sockaddr) > 3 else 0
+    return family, sockaddr[0], sockaddr[1], scope
 
 
 async def _do_resolve(host: str, port: int) -> list[tuple[int, tuple]]:
@@ -257,20 +283,51 @@ async def _do_resolve(host: str, port: int) -> list[tuple[int, tuple]]:
     if numeric is not None:
         return numeric
 
-    loop = asyncio.get_running_loop()
-    infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    infos = await asyncio.get_running_loop().getaddrinfo(
+        host, port, type=socket.SOCK_STREAM
+    )
     result: list[tuple[int, tuple]] = []
     seen: set[tuple] = set()
+    # Keep RFC 6724 order from the operating system; don't force IPv4 first.
     for family, _socktype, _proto, _canonname, sockaddr in infos:
-        identity = (family, sockaddr)
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        identity = _sockaddr_identity(family, sockaddr)
         if identity in seen:
             continue
         seen.add(identity)
         result.append((family, sockaddr))
-
-    # IPv4 first is usually safer on hosts where IPv6 routes exist but blackhole.
-    result.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
     return result
+
+
+def _interleave_families(
+    addresses: list[tuple[int, tuple]], preferred: tuple[int, tuple] | None
+) -> list[tuple[int, tuple]]:
+    """HEv2-style alternation while keeping an observed winner first."""
+    unique = list(addresses)
+    if preferred is not None:
+        try:
+            unique.remove(preferred)
+        except ValueError:
+            pass
+        else:
+            unique.insert(0, preferred)
+
+    if not unique:
+        return []
+    first_family = unique[0][0]
+    second_family = socket.AF_INET if first_family == socket.AF_INET6 else socket.AF_INET6
+    queues = {
+        first_family: [item for item in unique if item[0] == first_family],
+        second_family: [item for item in unique if item[0] == second_family],
+    }
+    ordered: list[tuple[int, tuple]] = []
+    while queues[first_family] or queues[second_family]:
+        if queues[first_family]:
+            ordered.append(queues[first_family].pop(0))
+        if queues[second_family]:
+            ordered.append(queues[second_family].pop(0))
+    return ordered
 
 
 async def _resolve(host: str, port: int) -> list[tuple[int, tuple]]:
@@ -290,79 +347,160 @@ async def _resolve(host: str, port: int) -> list[tuple[int, tuple]]:
             if _dns_inflight.get(key) is task and task.done():
                 _dns_inflight.pop(key, None)
         if len(_dns_cache) >= DNS_CACHE_MAX:
-            # TTL cache: a full clear is cheaper than LRU bookkeeping per stream.
             _dns_cache.clear()
             _route_cache.clear()
+            _route_health.clear()
         _dns_cache[key] = (now + DNS_TTL, list(result))
 
-    preferred = _route_cache.get(key)
-    if preferred and preferred[0] > now:
-        candidate = (preferred[1], preferred[2])
-        try:
-            result.remove(candidate)
-        except ValueError:
-            pass
-        result.insert(0, candidate)
-    return result
+    route = _route_cache.get(key)
+    preferred = None
+    if route and route[0] > now:
+        preferred = (route[1], route[2])
+    return _interleave_families(result, preferred)
+
+
+def _candidate_key(host: str, port: int, family: int, sockaddr: tuple) -> tuple:
+    return (host, port, *_sockaddr_identity(family, sockaddr))
+
+
+def _record_route_success(
+    host: str, port: int, family: int, sockaddr: tuple, connect_ms: float
+) -> None:
+    key = _candidate_key(host, port, family, sockaddr)
+    old = _route_health.get(key)
+    ewma = connect_ms if old is None else 0.70 * old[0] + 0.30 * connect_ms
+    _route_health[key] = (ewma, 0, 0.0)
+    _route_cache[(host, port)] = (
+        time.monotonic() + ROUTE_TTL, family, sockaddr
+    )
+
+
+def _record_route_failure(host: str, port: int, family: int, sockaddr: tuple) -> None:
+    key = _candidate_key(host, port, family, sockaddr)
+    old = _route_health.get(key, (9999.0, 0, 0.0))
+    failures = min(old[1] + 1, 8)
+    cooldown = min(ROUTE_FAILURE_BASE * (2 ** (failures - 1)), ROUTE_FAILURE_MAX)
+    _route_health[key] = (old[0], failures, time.monotonic() + cooldown)
+
+
+def _connection_schedule(
+    host: str, port: int, addresses: list[tuple[int, tuple]]
+) -> list[tuple[float, int, tuple]]:
+    """Start first IPv6 and first IPv4 together; stagger only extra addresses."""
+    # Never duplicate the same numeric endpoint: it adds target load and delays
+    # short web requests without providing another route. Dual-stack DNS still
+    # starts at least one candidate from each available family.
+    selected = list(addresses[:PARALLEL_CONNECT])
+
+    seen_family: set[int] = set()
+    extra_index = 0
+    schedule: list[tuple[float, int, tuple]] = []
+    now = time.monotonic()
+    for family, sockaddr in selected:
+        if family not in seen_family:
+            delay = DUAL_STACK_DELAY
+            seen_family.add(family)
+        else:
+            extra_index += 1
+            delay = ADDITIONAL_CONNECT_STAGGER * extra_index
+        health = _route_health.get(_candidate_key(host, port, family, sockaddr))
+        if health and health[2] > now:
+            # Failed routes still get retried, but never ahead of a healthy family.
+            delay = max(delay, ADDITIONAL_CONNECT_STAGGER * 2)
+        schedule.append((delay, family, sockaddr))
+    return schedule
+
+
+async def _connect_candidate(
+    delay: float, family: int, sockaddr: tuple
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, float]:
+    if delay > 0:
+        await asyncio.sleep(delay)
+    started = time.monotonic()
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setblocking(False)
+    try:
+        # Start the SYN immediately. Full high-throughput socket tuning happens
+        # after the race has a winner, so dozens of short page connections don't
+        # serialize behind setsockopt calls before they can even connect.
+        await asyncio.get_running_loop().sock_connect(sock, sockaddr)
+        reader, writer = await asyncio.open_connection(sock=sock, limit=STREAM_LIMIT)
+        return reader, writer, (time.monotonic() - started) * 1000.0
+    except BaseException:
+        sock.close()
+        raise
 
 
 async def _open_upstream(address: str, port: int):
-    """Race viable addresses and remember the winning route for later streams."""
+    """Adaptive Happy-Eyeballs: IPv6 improves without delaying IPv4 fallback."""
     try:
         addresses = await _resolve(address, port)
     except Exception:
         addresses = []
-
     if not addresses:
         return await asyncio.wait_for(
             asyncio.open_connection(address, port, limit=STREAM_LIMIT),
             timeout=CONNECT_TIMEOUT,
         )
 
-    candidates = addresses[:PARALLEL_CONNECT]
-    while len(candidates) < MIN_PARALLEL_CONNECT:
-        candidates.append(candidates[0])
+    # The common numeric/single-address case needs no task set or race. This
+    # keeps first-byte latency low for pages while the multi-address path below
+    # retains full Happy-Eyeballs behavior.
+    if len(addresses) == 1:
+        family, sockaddr = addresses[0]
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT):
+                reader, writer, connect_ms = await _connect_candidate(
+                    0.0, family, sockaddr
+                )
+        except Exception:
+            _record_route_failure(address, port, family, sockaddr)
+            raise
+        _record_route_success(address, port, family, sockaddr, connect_ms)
+        return reader, writer
 
-    async def attempt(index: int, family: int, sockaddr: tuple):
-        if index:
-            await asyncio.sleep(CONNECT_STAGGER * index)
-        reader, writer = await asyncio.open_connection(
-            host=sockaddr[0],
-            port=sockaddr[1],
-            family=family,
-            limit=STREAM_LIMIT,
-        )
-        return reader, writer, family, sockaddr
+    schedule = _connection_schedule(address, port, addresses)
+
+    async def attempt(delay: float, family: int, sockaddr: tuple):
+        try:
+            reader, writer, connect_ms = await _connect_candidate(
+                delay, family, sockaddr
+            )
+            return reader, writer, family, sockaddr, connect_ms
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _record_route_failure(address, port, family, sockaddr)
+            raise
 
     pending = {
-        asyncio.create_task(attempt(index, family, sockaddr))
-        for index, (family, sockaddr) in enumerate(candidates)
+        asyncio.create_task(attempt(delay, family, sockaddr))
+        for delay, family, sockaddr in schedule
     }
     winner = None
     last_error: Exception | None = None
     deadline = time.monotonic() + CONNECT_TIMEOUT
-
     try:
         while pending and winner is None:
-            timeout = max(deadline - time.monotonic(), 0.01)
             done, pending = await asyncio.wait(
-                pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                pending,
+                timeout=max(deadline - time.monotonic(), 0.01),
+                return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
                 raise asyncio.TimeoutError
+            successes = []
             for task in done:
                 try:
-                    result = task.result()
+                    successes.append(task.result())
                 except Exception as exc:
                     last_error = exc
-                    continue
-                if winner is None:
-                    winner = result
-                else:
-                    try:
-                        result[1].close()
-                    except Exception:
-                        pass
+            if successes:
+                # If both families completed in the same loop turn, keep lower RTT.
+                successes.sort(key=lambda item: item[4])
+                winner = successes[0]
+                for result in successes[1:]:
+                    result[1].close()
     finally:
         for task in pending:
             task.cancel()
@@ -370,20 +508,12 @@ async def _open_upstream(address: str, port: int):
             results = await asyncio.gather(*pending, return_exceptions=True)
             for result in results:
                 if isinstance(result, tuple):
-                    try:
-                        result[1].close()
-                    except Exception:
-                        pass
+                    result[1].close()
 
     if winner is None:
         raise last_error or OSError(f"connect failed: {address}:{port}")
-
-    reader, writer, family, sockaddr = winner
-    _route_cache[(address, port)] = (
-        time.monotonic() + ROUTE_TTL,
-        family,
-        sockaddr,
-    )
+    reader, writer, family, sockaddr, connect_ms = winner
+    _record_route_success(address, port, family, sockaddr, connect_ms)
     return reader, writer
 
 
@@ -461,18 +591,9 @@ def _speed_limited(uid: str) -> bool:
     return bool(link and int(link.get("speed_limit_bytes", 0) or 0) > 0)
 
 
-async def _account(gate: QuotaGate, nbytes: int) -> bool:
-    """Synchronous hot path; await only when a real accounting batch is full."""
-    stage = getattr(gate, "stage", None)
-    commit = getattr(gate, "commit", None)
-    if stage is None or commit is None:
-        return await gate.add(nbytes)
-    amount = stage(nbytes)
-    if amount < 0:
-        return False
-    if amount:
-        return await commit(amount)
-    return True
+def _account_stage(gate: QuotaGate, nbytes: int) -> int:
+    """Non-async per-frame hot path: -1 denied, 0 continue, >0 commit batch."""
+    return gate.stage(nbytes)
 
 
 # ── Relay: WebSocket -> target TCP ──────────────────────────────────────────
@@ -504,7 +625,10 @@ async def relay_ws_to_tcp(
                 continue
 
             nbytes = len(data)
-            if not await _account(gate, nbytes):
+            account_batch = _account_stage(gate, nbytes)
+            if account_batch < 0 or (
+                account_batch and not await gate.commit(account_batch)
+            ):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
 
@@ -612,7 +736,10 @@ async def relay_tcp_to_ws(
             elif nbytes < READ_MIN // 4:
                 bulk_streak = max(bulk_streak - 1, 0)
 
-            if not await _account(gate, nbytes):
+            account_batch = _account_stage(gate, nbytes)
+            if account_batch < 0 or (
+                account_batch and not await gate.commit(account_batch)
+            ):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
 

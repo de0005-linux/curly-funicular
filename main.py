@@ -248,7 +248,11 @@ def get_host(request: Request | None = None) -> str:
     if request is not None:
         h = request.headers.get("x-forwarded-host") or request.headers.get("host")
         if h:
-            h = h.split(":")[0]
+            # Preserve literal IPv6 hosts. For domains/IPv4 strip only a real :port.
+            if h.startswith("[") and "]" in h:
+                h = h[1:h.index("]")]
+            elif h.count(":") == 1:
+                h = h.rsplit(":", 1)[0]
             CONFIG["host"] = h  # کش آخرین دامنه‌ی واقعی دیده‌شده، برای جاهایی که request نداریم (مثل ربات تلگرام)
             return h
     return os.environ.get("RAILWAY_PUBLIC_DOMAIN", CONFIG["host"])
@@ -1216,49 +1220,66 @@ if __name__ == "__main__":
     # هر اتصال WebSocket پذیرفته‌شده این تنظیمات را ارث می‌برد → مسیر دانلود به کلاینت پهن می‌شود.
     import socket as _socket
 
-    _listen_sock = None
-    try:
-        _listen_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-        _listen_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        _listen_sock.bind(("0.0.0.0", CONFIG["port"]))
-        _listen_sock.listen(8192)
-        _listen_sock.set_inheritable(True)
-        # Best effort: TFO و DEFER_ACCEPT فقط روی لینوکس/کرنل مجاز اعمال می‌شوند.
-        _tfo = getattr(_socket, "TCP_FASTOPEN", None)
-        if _tfo is not None:
-            try:
-                _listen_sock.setsockopt(_socket.IPPROTO_TCP, _tfo, 4096)
-            except OSError:
-                pass
-        _defer = getattr(_socket, "TCP_DEFER_ACCEPT", None)
-        if _defer is not None:
-            try:
-                _listen_sock.setsockopt(_socket.IPPROTO_TCP, _defer, 1)
-            except OSError:
-                pass
-        for _opt, _val in (
-            (_socket.SO_SNDBUF, 16 * 1024 * 1024),
-            (_socket.SO_RCVBUF, 16 * 1024 * 1024),
-        ):
-            try:
-                _listen_sock.setsockopt(_socket.SOL_SOCKET, _opt, _val)
-            except OSError:
-                pass
-        _cc = getattr(_socket, "TCP_CONGESTION", None)
-        if _cc is not None:
-            for _algo in (b"bbr", b"cubic"):
+    def _prepare_listen_socket(family, bind_address):
+        sock = _socket.socket(family, _socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            if family == _socket.AF_INET6:
+                # One dual-stack socket accepts native IPv6 and IPv4-mapped peers.
+                # If the kernel cannot guarantee V6ONLY=0 we close it and fall back
+                # to the old IPv4 listener, so IPv4 can never regress.
+                sock.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 0)
+                if sock.getsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY) != 0:
+                    raise OSError("kernel keeps IPV6_V6ONLY enabled")
+            sock.bind(bind_address)
+            sock.listen(16384)
+            sock.set_inheritable(True)
+
+            tfo = getattr(_socket, "TCP_FASTOPEN", None)
+            if tfo is not None:
                 try:
-                    _listen_sock.setsockopt(_socket.IPPROTO_TCP, _cc, _algo)
-                    break
+                    sock.setsockopt(_socket.IPPROTO_TCP, tfo, 8192)
                 except OSError:
-                    continue
-    except Exception:
-        if _listen_sock is not None:
-            try:
-                _listen_sock.close()
-            except Exception:
-                pass
-        _listen_sock = None
+                    pass
+            defer_accept = getattr(_socket, "TCP_DEFER_ACCEPT", None)
+            if defer_accept is not None:
+                try:
+                    sock.setsockopt(_socket.IPPROTO_TCP, defer_accept, 1)
+                except OSError:
+                    pass
+            for option, value in (
+                (_socket.SO_SNDBUF, 32 * 1024 * 1024),
+                (_socket.SO_RCVBUF, 32 * 1024 * 1024),
+            ):
+                try:
+                    sock.setsockopt(_socket.SOL_SOCKET, option, value)
+                except OSError:
+                    pass
+            congestion = getattr(_socket, "TCP_CONGESTION", None)
+            if congestion is not None:
+                for algorithm in (b"bbr", b"cubic"):
+                    try:
+                        sock.setsockopt(_socket.IPPROTO_TCP, congestion, algorithm)
+                        break
+                    except OSError:
+                        continue
+            return sock
+        except BaseException:
+            sock.close()
+            raise
+
+    _listen_sock = None
+    # Prefer a true dual-stack listener. IPv4-only is a guaranteed fallback.
+    for _family, _bind, _label in (
+        (_socket.AF_INET6, ("::", CONFIG["port"]), "IPv6+IPv4 dual-stack"),
+        (_socket.AF_INET, ("0.0.0.0", CONFIG["port"]), "IPv4 fallback"),
+    ):
+        try:
+            _listen_sock = _prepare_listen_socket(_family, _bind)
+            logger.info("Listening on %s port %s", _label, CONFIG["port"])
+            break
+        except OSError as _listen_error:
+            logger.warning("Cannot enable %s listener: %s", _label, _listen_error)
 
     _config = uvicorn.Config(
         "main:app",
@@ -1270,11 +1291,11 @@ if __name__ == "__main__":
         http=_http,
         ws=_ws_protocol,
         ws_max_size=64 * 1024 * 1024,
-        ws_max_queue=256,
+        ws_max_queue=512,
         ws_ping_interval=None,
         ws_ping_timeout=None,
         ws_per_message_deflate=False,
-        backlog=8192,
+        backlog=16384,
         timeout_keep_alive=120,
         limit_concurrency=None,
         limit_max_requests=None,

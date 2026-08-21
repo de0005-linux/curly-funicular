@@ -1,10 +1,11 @@
 """Uvicorn WebSocket data-plane tuned for bulk VLESS/WS transfers.
 
-This module deliberately stays on Uvicorn's supported Sans-I/O WebSocket engine;
-it only changes queue watermarks, accepted-socket tuning, and exposes two small
-fast-path methods that avoid the Starlette/ASGI dictionary hop for each binary
-message.  All framing, masking validation, close handling and protocol state
-remain owned by ``websockets``.
+Inbound parsing, masking checks, close/ping handling and protocol state stay on
+Uvicorn's supported Sans-I/O ``websockets`` engine. The only outbound shortcut
+is an RFC 6455 server-binary header followed by the existing payload object when
+compression is disabled; this removes a full multi-MiB BytesIO copy. Queue
+watermarks, accepted-socket tuning and direct relay hooks remove the remaining
+per-frame ASGI overhead while preserving bounded backpressure.
 
 The implementation is pinned to Uvicorn 0.52.4 in requirements.txt.  If this
 module cannot be imported, main.py falls back to Uvicorn's stock protocol.
@@ -15,13 +16,13 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import struct
 from typing import Any
 
 from uvicorn.protocols.utils import ClientDisconnected
 from uvicorn.protocols.websockets.websockets_sansio_impl import (
     WebSocketsSansIOProtocol,
 )
-from websockets.exceptions import InvalidState
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -35,17 +36,24 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 # A stock Uvicorn Sans-I/O connection pauses transport reading after *every*
 # complete message. Xray sends many binary messages while downloading/uploading;
 # pause/resume on each one becomes an avoidable syscall/event-loop bottleneck.
-RX_QUEUE_HIGH = _env_int("WS_TURBO_QUEUE_HIGH", 128, 8, 1024)
-RX_QUEUE_LOW = _env_int("WS_TURBO_QUEUE_LOW", 32, 1, RX_QUEUE_HIGH - 1)
+RX_QUEUE_HIGH = _env_int("WS_TURBO_QUEUE_HIGH", 256, 8, 2048)
+RX_QUEUE_LOW = _env_int("WS_TURBO_QUEUE_LOW", 64, 1, RX_QUEUE_HIGH - 1)
+RX_QUEUE_BYTES_HIGH = _env_int(
+    "WS_TURBO_QUEUE_BYTES_HIGH", 64 * 1024 * 1024, 4 * 1024 * 1024, 512 * 1024 * 1024
+)
+RX_QUEUE_BYTES_LOW = min(
+    _env_int("WS_TURBO_QUEUE_BYTES_LOW", 16 * 1024 * 1024, 1024 * 1024, 128 * 1024 * 1024),
+    RX_QUEUE_BYTES_HIGH // 2,
+)
 
 SOCKET_BUFFER = _env_int(
-    "WS_TURBO_SOCKET_BUFFER", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024
+    "WS_TURBO_SOCKET_BUFFER", 32 * 1024 * 1024, 256 * 1024, 128 * 1024 * 1024
 )
 WRITE_BUFFER_HIGH = _env_int(
-    "WS_TURBO_WRITE_HIGH", 8 * 1024 * 1024, 256 * 1024, 32 * 1024 * 1024
+    "WS_TURBO_WRITE_HIGH", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024
 )
 WRITE_BUFFER_LOW = min(
-    _env_int("WS_TURBO_WRITE_LOW", 1024 * 1024, 64 * 1024, 8 * 1024 * 1024),
+    _env_int("WS_TURBO_WRITE_LOW", 2 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
     WRITE_BUFFER_HIGH // 2,
 )
 PREFERRED_CC = (b"bbr", b"cubic")
@@ -96,6 +104,21 @@ def _tune_accepted_socket(transport: asyncio.Transport) -> None:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)
     except OSError:
         pass
+    ipv6_tclass = getattr(socket, "IPV6_TCLASS", None)
+    if ipv6_tclass is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, ipv6_tclass, 0x10)
+        except OSError:
+            pass
+
+
+def _binary_header(length: int) -> bytes:
+    """RFC 6455 FIN+binary header for an unmasked server frame."""
+    if length < 126:
+        return bytes((0x82, length))
+    if length < 65536:
+        return struct.pack("!BBH", 0x82, 126, length)
+    return struct.pack("!BBQ", 0x82, 127, length)
 
 
 class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
@@ -103,6 +126,7 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         super().connection_made(transport)
+        self._turbo_queue_bytes = 0
         _tune_accepted_socket(self.transport)
 
     def send_receive_event_to_app(self) -> None:
@@ -133,13 +157,26 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
             message = {"type": "websocket.receive", "bytes": data}
 
         self.queue.put_nowait(message)  # type: ignore[arg-type]
-        if not self.read_paused and self.queue.qsize() >= RX_QUEUE_HIGH:
+        self._turbo_queue_bytes = getattr(self, "_turbo_queue_bytes", 0) + len(data)
+        if not self.read_paused and (
+            self.queue.qsize() >= RX_QUEUE_HIGH
+            or self._turbo_queue_bytes >= RX_QUEUE_BYTES_HIGH
+        ):
             self.read_paused = True
             self.transport.pause_reading()
 
     async def receive(self):
         message = await self.queue.get()
-        if self.read_paused and self.queue.qsize() <= RX_QUEUE_LOW:
+        payload = message.get("bytes")
+        if payload is None:
+            payload = message.get("text") or ""
+        self._turbo_queue_bytes = max(
+            0, getattr(self, "_turbo_queue_bytes", 0) - len(payload)
+        )
+        if self.read_paused and (
+            self.queue.qsize() <= RX_QUEUE_LOW
+            and self._turbo_queue_bytes <= RX_QUEUE_BYTES_LOW
+        ):
             self.read_paused = False
             self.transport.resume_reading()
         return message
@@ -149,11 +186,13 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
         return await self.receive()
 
     async def turbo_send_bytes(self, data: bytes | bytearray | memoryview) -> None:
-        """Send one official Sans-I/O binary frame without the ASGI dict hop.
+        """Send an uncompressed server binary frame without copying its payload.
 
-        This does not handcraft WebSocket frames. ``websockets`` still validates
-        protocol state and serializes the frame; we only avoid Starlette and
-        Uvicorn unpacking/repacking an ASGI message for every payload.
+        Uvicorn/websockets normally serializes the entire frame through BytesIO,
+        which duplicates every multi-MiB download chunk. Compression is disabled
+        in main.py, so a legal server frame is just a small unmasked header followed
+        by the existing payload object. There is no await between the two writes,
+        therefore ping/close frames cannot interleave with this frame.
         """
         if not self.writable.is_set():
             await self.writable.wait()
@@ -165,16 +204,13 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
         ):
             raise ClientDisconnected()
 
-        try:
-            self.conn.send_binary(data)
-            output = self.conn.data_to_send()
-        except InvalidState as exc:
-            raise ClientDisconnected() from exc
+        # Safety fallback if someone later enables per-message compression.
+        if self.config.ws_per_message_deflate:
+            await self.send({"type": "websocket.send", "bytes": bytes(data)})
+            return
 
-        # Keep buffers separate when Sans-I/O returns header + payload pieces;
-        # b''.join(...) would create a full-size duplicate of a multi-MB frame.
-        for part in output:
-            self.transport.write(part)
+        self.transport.write(_binary_header(len(data)))
+        self.transport.write(data)
 
     async def turbo_flush(self) -> None:
         """Wait until transport backpressure has dropped below its low watermark."""
