@@ -41,6 +41,8 @@ READ_START = 1024 * 1024
 STREAM_LIMIT = 32 * 1024 * 1024
 BULK_TRIGGER = 128 * 1024
 BULK_STREAK_TRIGGER = 2
+WS_UPLOAD_BURST_MESSAGES = 32
+WS_UPLOAD_BURST_BYTES = 4 * 1024 * 1024
 
 WRITE_HW_MIN = 512 * 1024
 WRITE_HW_MAX = 64 * 1024 * 1024
@@ -98,12 +100,15 @@ class _AdaptiveFlow:
 class _WSIO:
     """Select custom Uvicorn fast hooks when available, otherwise use Starlette."""
 
-    __slots__ = ("ws", "protocol", "_receive", "_send", "_flush")
+    __slots__ = (
+        "ws", "protocol", "_receive", "_receive_nowait", "_send", "_flush"
+    )
 
     def __init__(self, ws: WebSocket) -> None:
         self.ws = ws
         self.protocol = _ws_protocol_owner(ws)
         self._receive = getattr(self.protocol, "turbo_receive", None)
+        self._receive_nowait = getattr(self.protocol, "turbo_receive_nowait", None)
         self._send = getattr(self.protocol, "turbo_send_bytes", None)
         self._flush = getattr(self.protocol, "turbo_flush", None)
 
@@ -111,6 +116,11 @@ class _WSIO:
         if self._receive is not None:
             return await self._receive()
         return await self.ws.receive()
+
+    def receive_nowait(self) -> dict | None:
+        if self._receive_nowait is None:
+            return None
+        return self._receive_nowait()
 
     async def send_bytes(self, data: bytes | bytearray | memoryview) -> None:
         if self._send is not None:
@@ -517,6 +527,17 @@ async def _open_upstream(address: str, port: int):
     return reader, writer
 
 
+# Public shared data-plane helpers used by XHTTP. Keeping both transports on the
+# same connector means IPv6/IPv4 racing, route memory and socket tuning stay
+# identical instead of slowly diverging into two implementations.
+async def open_upstream(address: str, port: int):
+    return await _open_upstream(address, port)
+
+
+def tune_upstream_socket(writer: asyncio.StreamWriter, high_water: int = WRITE_HW_START) -> None:
+    _tune_socket(writer, high_water)
+
+
 # ── VLESS header + accounting ────────────────────────────────────────────────
 def _parse_vless_header(chunk: bytes | bytearray | memoryview):
     view = memoryview(chunk)
@@ -612,39 +633,53 @@ async def relay_ws_to_tcp(
     transport = writer.transport
     ticks = 0
 
+    stop = False
     try:
-        while True:
+        while not stop:
             message = await io.receive()
-            if message["type"] == "websocket.disconnect":
-                break
-            data = message.get("bytes")
-            if data is None:
-                text = message.get("text")
-                data = text.encode() if text else None
-            if not data:
-                continue
+            burst_messages = 0
+            burst_bytes = 0
+            while message is not None:
+                burst_messages += 1
+                if message["type"] == "websocket.disconnect":
+                    stop = True
+                    break
+                data = message.get("bytes")
+                if data is None:
+                    text = message.get("text")
+                    data = text.encode() if text else None
+                if data:
+                    nbytes = len(data)
+                    account_batch = _account_stage(gate, nbytes)
+                    if account_batch < 0 or (
+                        account_batch and not await gate.commit(account_batch)
+                    ):
+                        await ws.close(code=1008, reason="quota/disabled/unknown")
+                        stop = True
+                        break
 
-            nbytes = len(data)
-            account_batch = _account_stage(gate, nbytes)
-            if account_batch < 0 or (
-                account_batch and not await gate.commit(account_batch)
-            ):
-                await ws.close(code=1008, reason="quota/disabled/unknown")
-                break
+                    ticks += 1
+                    if not (ticks & 127):
+                        limited = _speed_limited(uid)
+                    if limited:
+                        await throttle(uid, nbytes)
+                    if conn is not None:
+                        conn["bytes"] += nbytes
+                    writer.write(data)
+                    burst_bytes += nbytes
 
-            ticks += 1
-            if not (ticks & 127):
-                limited = _speed_limited(uid)
-            if limited:
-                await throttle(uid, nbytes)
-
-            if conn is not None:
-                conn["bytes"] += nbytes
-            writer.write(data)
-            if transport.get_write_buffer_size() >= flow.high_water:
-                started = time.monotonic()
-                await writer.drain()
-                flow.observe((time.monotonic() - started) * 1000.0, transport)
+                if transport.get_write_buffer_size() >= flow.high_water:
+                    started = time.monotonic()
+                    await writer.drain()
+                    flow.observe((time.monotonic() - started) * 1000.0, transport)
+                    break
+                if (
+                    limited
+                    or burst_messages >= WS_UPLOAD_BURST_MESSAGES
+                    or burst_bytes >= WS_UPLOAD_BURST_BYTES
+                ):
+                    break
+                message = io.receive_nowait()
     except (WebSocketDisconnect, ConnectionError, OSError):
         pass
     finally:

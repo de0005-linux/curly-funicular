@@ -126,7 +126,7 @@ LINKS_LOCK = asyncio.Lock()
 SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
 
-# پروتکل‌های پشتیبانی‌شده برای هر کانفیگ
+# پروتکل‌های پشتیبانی‌شده برای هر ��انفیگ
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one", "xhttp-auto")
 DEFAULT_PROTOCOL = "vless-ws"
 
@@ -141,26 +141,38 @@ DEFAULT_ALPN_BY_PROTOCOL = {
     "xhttp-stream-up": "h2,http/1.1",
     # stream-one ذاتاً دوطرفه است و فقط روی HTTP/2 کار می‌کند؛ http/1.1 را تبلیغ نمی‌کنیم
     "xhttp-stream-one": "h2",
-    # auto روی h2 به stream-one می‌رود و روی http/1.1 به packet-up برمی‌گردد
+    # auto را خود Xray بر اساس امنیت/مسیر انتخاب می‌کند؛ سرور هر سه مد را می‌پذیرد
     "xhttp-auto": "h2,http/1.1",
 }
-# xmux برای مدهای XHTTP: کلاینت Xray چندین اتصال HTTP/2 موازی باز می‌کند و
-# جریان‌ها را روی آن‌ها پخش می‌کند → پهنای باند بیشتر (به قیمت مصرف بیشتر).
-# کلاینت‌های قدیمی که extra را نمی‌شناسند ساده نادیده‌اش می‌گیرند.
-XHTTP_EXTRA_JSON = json.dumps(
-    {
-        # حجم مصرفی مهم نیست → xmux تهاجمی: تا ۱۶ اتصال HTTP/2 موازی،
-        # هر کدام تا ۶۴ جریان هم‌زمان، با keep-alive کوتاه‌تر و چرخش بیشتر.
+# XHTTP/XMUX profile shared in generated links. Packet-up's stock client waits
+# 30 ms between ~1 MB POSTs; 4 MB posts with a 1 ms floor remove that upload cap.
+# XMUX is kept aggressive but bounded: enough H2 carriers for high throughput
+# without the 1024-stream/RAM explosion of the previous 32-64 × 8-16 profile.
+def _xhttp_extra_json(mode: str) -> str:
+    extra = {
+        "xPaddingBytes": "100-500",
+        "noGRPCHeader": False,
+        "noSSEHeader": False,
         "xmux": {
-            "maxConcurrency": "32-64",
-            "maxConnections": "8-16",
-            "cMaxReuseTimes": "128-256",
-            "hMaxRequestTimes": "800-900",
-            "hKeepAlivePeriod": 30,
-        }
-    },
-    separators=(",", ":"),
-)
+            "maxConcurrency": "8-16",
+            "maxConnections": "4-8",
+            "cMaxReuseTimes": "256-512",
+            "hMaxRequestTimes": "800-1200",
+            "hMaxReusableSecs": "1800-3600",
+            "hKeepAlivePeriod": 0,
+        },
+    }
+    if mode in ("packet-up", "auto"):
+        extra.update(
+            {
+                "scMaxEachPostBytes": 4_000_000,
+                "scMinPostsIntervalMs": 1,
+                "scMaxBufferedPosts": 64,
+            }
+        )
+    if mode in ("stream-up", "auto"):
+        extra["scStreamUpServerSecs"] = "20-40"
+    return json.dumps(extra, separators=(",", ":"))
 
 DEFAULT_PORT = 443
 MIN_PORT, MAX_PORT = 1, 65535
@@ -298,8 +310,8 @@ def generate_vless_link(
             "alpn": alpn_val,
         }
     else:
-        # xhttp-packet-up / xhttp-stream-up / xhttp-stream-one
-        mode = protocol.replace("xhttp-", "")  # packet-up | stream-up | stream-one
+        # xhttp-packet-up / xhttp-stream-up / xhttp-stream-one / xhttp-auto
+        mode = protocol.replace("xhttp-", "")
         path = f"/xhttp-siz10/{mode}/{uuid}"
         params = {
             "encryption": "none",
@@ -311,11 +323,14 @@ def generate_vless_link(
             "sni": host,
             "fp": fp,
             "alpn": alpn_val,
-            # xmux: کلاینت چندین اتصال HTTP/2 موازی باز می‌کند و جریان‌ها را پخش می‌کند
-            "extra": XHTTP_EXTRA_JSON,
+            # packet sizing + bounded XMUX profile tuned for this mode
+            "extra": _xhttp_extra_json(mode),
         }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{host}:{port_val}?{query}#{quote(remark)}"
+    authority_host = host
+    if ":" in host and not host.startswith("["):
+        authority_host = f"[{host}]"
+    return f"vless://{uuid}@{authority_host}:{port_val}?{query}#{quote(remark)}"
 
 def vless_link_for_link(link: dict, uid: str, host: str) -> str:
     """generate_vless_link رو با تنظیمات دستی همون کانفیگ (fingerprint/alpn/port) صدا می‌زنه."""
@@ -1064,10 +1079,10 @@ app.include_router(xhttp_router)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ربات مدیریت تلگرام (اختیاری — فقط اگه TELEGRAM_BOT_TOKEN ست شده باشه فعال می‌شه)
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════���══════════════════════════════════════════════════════════════
 from telegram_bot import start_bot as _tg_start_bot, stop_bot as _tg_stop_bot
 
-# ── HTTP Proxy ────────────────────────────────────────────────────────────────
+# ── HTTP Proxy ��───────────────────────────────────────────────────────────────
 _HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
         "te","trailers","transfer-encoding","upgrade","content-encoding","content-length"}
 

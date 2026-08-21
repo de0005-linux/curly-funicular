@@ -165,8 +165,7 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
             self.read_paused = True
             self.transport.pause_reading()
 
-    async def receive(self):
-        message = await self.queue.get()
+    def _after_receive(self, message):
         payload = message.get("bytes")
         if payload is None:
             payload = message.get("text") or ""
@@ -181,9 +180,20 @@ class TurboWebSocketsSansIOProtocol(WebSocketsSansIOProtocol):
             self.transport.resume_reading()
         return message
 
+    async def receive(self):
+        return self._after_receive(await self.queue.get())
+
     async def turbo_receive(self):
         """Direct receive hook used by relay_vless after Starlette accepted WS."""
         return await self.receive()
+
+    def turbo_receive_nowait(self):
+        """Take another queued frame without a coroutine/await in upload bursts."""
+        try:
+            message = self.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        return self._after_receive(message)
 
     async def turbo_send_bytes(self, data: bytes | bytearray | memoryview) -> None:
         """Send an uncompressed server binary frame without copying its payload.

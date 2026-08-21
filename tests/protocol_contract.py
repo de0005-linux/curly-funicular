@@ -23,17 +23,24 @@ async def main():
     p.frames=[]; p.close_sent=False; p.curr_msg_data_type='bytes'; p.queue=asyncio.Queue()
     p.read_paused=False; p.transport=Transport(); p.logger=types.SimpleNamespace(exception=lambda *a,**k:None)
     marker=b'unique'; p.frames=[marker]; p.send_receive_event_to_app()
-    event=await p.queue.get(); assert event['bytes'] is marker
+    event=await p.receive(); assert event['bytes'] is marker
     for i in range(mod.RX_QUEUE_HIGH):
         p.frames=[bytes((i&255,))]; p.send_receive_event_to_app()
     assert p.transport.pauses==1 and p.read_paused
     while p.queue.qsize()>mod.RX_QUEUE_LOW: await p.receive()
     assert p.transport.resumes==1 and not p.read_paused
+    while not p.queue.empty(): await p.receive()
+    assert p._turbo_queue_bytes==0
+    p.frames=[b'burst']; p.send_receive_event_to_app()
+    queued=p._turbo_queue_bytes
+    burst=p.turbo_receive_nowait()
+    assert burst['bytes']==b'burst' and p._turbo_queue_bytes==queued-5
+    assert p.turbo_receive_nowait() is None
     p.writable=asyncio.Event(); p.writable.set(); p.disconnected=False; p.close_sent=False
     p.handshake_complete=True; p.config=types.SimpleNamespace(ws_per_message_deflate=False); p.transport=Transport()
     payload=bytearray(b'x'*70000); await p.turbo_send_bytes(payload)
     assert len(p.transport.writes)==2
     assert p.transport.writes[0]==mod._binary_header(len(payload))
     assert p.transport.writes[1] is payload
-    print(f'protocol: queue={mod.RX_QUEUE_HIGH}/{mod.RX_QUEUE_LOW} direct-payload=True OK')
+    print(f'protocol: queue={mod.RX_QUEUE_HIGH}/{mod.RX_QUEUE_LOW} burst-nowait=True direct-payload=True OK')
 asyncio.run(main())

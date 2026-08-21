@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Reproduce `python main.py` startup with dependency stubs and catch import cycles."""
-import asyncio, pathlib, sys, types
+import asyncio, json, pathlib, sys, types
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 
@@ -50,7 +50,11 @@ try:
     exec(code,module.__dict__)
     assert sys.modules.get('main') is module
     assert module.RELAY_BUF > 0
+    extra=json.loads(module._xhttp_extra_json('auto'))
+    assert extra['scMaxEachPostBytes']==4_000_000
+    assert extra['scMinPostsIntervalMs']==1
+    assert extra['xmux']['maxConnections']=='4-8'
     assert Server.ran
-    print(f'python-main startup: alias=True RELAY_BUF={module.RELAY_BUF} server.run=True OK')
+    print(f"python-main startup: alias=True RELAY_BUF={module.RELAY_BUF} xhttp-post={extra['scMaxEachPostBytes']} server.run=True OK")
 finally:
     if old_main is not None: sys.modules['__main__']=old_main

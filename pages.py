@@ -1084,19 +1084,19 @@ body{font-size:14.5px}
             <div class="proto-card-check"><i class="ti ti-check"></i></div>
             <div class="proto-card-icon"><i class="ti ti-rocket"></i></div>
             <div class="proto-card-title">XHTTP · stream-up</div>
-            <div class="proto-card-desc">Lower latency</div>
+            <div class="proto-card-desc">Best TLS/H2 speed</div>
           </div>
           <div class="proto-card" data-val="xhttp-stream-one" onclick="selectProto('xhttp-stream-one',this)">
             <div class="proto-card-check"><i class="ti ti-check"></i></div>
             <div class="proto-card-icon"><i class="ti ti-arrows-exchange"></i></div>
             <div class="proto-card-title">XHTTP · stream-one</div>
-            <div class="proto-card-desc">Full-duplex, fastest · needs HTTP/2</div>
+            <div class="proto-card-desc">Full-duplex · proxy dependent</div>
           </div>
           <div class="proto-card" data-val="xhttp-auto" onclick="selectProto('xhttp-auto',this)">
             <div class="proto-card-check"><i class="ti ti-check"></i></div>
             <div class="proto-card-icon"><i class="ti ti-wand"></i></div>
             <div class="proto-card-title">XHTTP · auto</div>
-            <div class="proto-card-desc">stream-one on H2, packet-up fallback</div>
+            <div class="proto-card-desc">Xray selects the compatible mode</div>
           </div>
         </div>
       </div>
