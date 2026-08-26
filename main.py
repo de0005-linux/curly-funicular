@@ -694,6 +694,112 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
     return {"ok": True}
 
+# ── Outbound / Exit IP (ProxyIP) ────────────────────────────────
+OUTBOUND_KEYS = ("mode", "proxyip", "concurrency", "fallback", "global_proxy", "force_hosts", "proxy_url")
+
+
+def _validate_outbound(payload: dict) -> dict:
+    """اعتبارسنجی قبل از configure — configure مقادیر نامعتبر را بی‌صدا رد می‌کند."""
+    clean: dict = {}
+    for key in OUTBOUND_KEYS:
+        if key in payload:
+            clean[key] = payload[key]
+
+    if "mode" in clean:
+        mode = str(clean["mode"] or "direct").strip().lower()
+        if mode not in outbound.MODES:
+            raise HTTPException(status_code=400, detail="مد نامعتبر است: " + mode)
+        clean["mode"] = mode
+
+    if "concurrency" in clean:
+        try:
+            clean["concurrency"] = max(1, min(16, int(clean["concurrency"] or 1)))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="دایال موازی باید عدد باشد")
+
+    if "proxyip" in clean:
+        raw = str(clean["proxyip"] or "").strip()
+        clean["proxyip"] = raw
+        if raw:
+            try:
+                pool = outbound.parse_endpoint_list(raw)
+            except Exception:
+                pool = []
+            if not pool:
+                raise HTTPException(status_code=400, detail="لیست ProxyIP قابل تحلیل نیست")
+
+    if "proxy_url" in clean:
+        raw = str(clean["proxy_url"] or "").strip()
+        clean["proxy_url"] = raw
+        if raw:
+            pmode = clean.get("mode") or outbound.SETTINGS.get("mode") or "socks5"
+            if pmode not in ("socks5", "http", "https"):
+                pmode = "socks5"
+            try:
+                outbound.parse_proxy_url(raw, pmode)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail="آدرس پروکسی نامعتبر است: " + str(exc))
+
+    if "force_hosts" in clean:
+        clean["force_hosts"] = str(clean["force_hosts"] or "").strip()
+
+    for key in ("fallback", "global_proxy"):
+        if key in clean:
+            clean[key] = bool(clean[key])
+
+    final_mode = clean.get("mode") or outbound.SETTINGS.get("mode") or "direct"
+    if final_mode == "proxyip":
+        pip = clean.get("proxyip", outbound.SETTINGS.get("proxyip"))
+        if not str(pip or "").strip():
+            raise HTTPException(status_code=400, detail="برای مد ProxyIP حداقل یک آی‌پی یا دامنه لازم است")
+    if final_mode in ("socks5", "http", "https"):
+        purl = clean.get("proxy_url", outbound.SETTINGS.get("proxy_url"))
+        if not str(purl or "").strip():
+            raise HTTPException(status_code=400, detail="آدرس پروکسی زنجیره‌ای وارد نشده است")
+    return clean
+
+
+@app.get("/api/outbound")
+async def get_outbound(_=Depends(require_auth)):
+    return {
+        "ok": True,
+        "settings": outbound.settings_summary(),
+        "modes": list(outbound.MODES),
+        "active": outbound.is_active(),
+    }
+
+
+@app.post("/api/outbound")
+async def set_outbound(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="بدنه‌ی درخواست نامعتبر است")
+    clean = _validate_outbound(body)
+    if not clean:
+        raise HTTPException(status_code=400, detail="چیزی برای تغییر ارسال نشده است")
+    outbound.configure(**clean)
+    await save_state()
+    mode_now = str(outbound.SETTINGS.get("mode") or "direct")
+    log_activity("outbound", "آی‌پی خروجی روی مد «" + mode_now + "» تنطیم شد", "ok")
+    return {
+        "ok": True,
+        "settings": outbound.settings_summary(),
+        "active": outbound.is_active(),
+    }
+
+
+@app.post("/api/outbound/test")
+async def test_outbound(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    target = str(body.get("target") or "").strip() or "www.cloudflare.com"
+    result = await outbound.probe(target_host=target)
+    return {"ok": True, "result": result}
+
 # ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
@@ -1039,6 +1145,22 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
             link["speed_limit_bytes"] = 0 if sv <= 0 else parse_speed_to_bytes(sv, su)
             from speed_limit import reset_bucket
             reset_bucket(uid)
+        if "outbound" in body:
+            ob = body["outbound"]
+            if not ob:
+                link.pop("outbound", None)
+            elif isinstance(ob, dict):
+                link["outbound"] = _validate_outbound(ob)
+            else:
+                raise HTTPException(status_code=400, detail="outbound باید آبجکت باشد")
+        if "proxyip" in body:
+            pip = str(body.get("proxyip") or "").strip()
+            if pip and not outbound.parse_endpoint_list(pip):
+                raise HTTPException(status_code=400, detail="لیست ProxyIP قابل تحلیل نیست")
+            if pip:
+                link["proxyip"] = pip
+            else:
+                link.pop("proxyip", None)
         if any(k in body for k in ("label", "note", "limit_value", "expires_days", "fingerprint", "alpn", "port", "ip_limit", "speed_limit_value")):
             log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد", "info")
         new_sub = body.get("sub_id", "UNCHANGED")
