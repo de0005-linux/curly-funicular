@@ -30,6 +30,7 @@ from relay_vless import (
     open_upstream,
     tune_upstream_socket,
 )
+from outbound import open_outbound
 from speed_limit import QuotaGate, throttle
 
 router = APIRouter()
@@ -446,9 +447,12 @@ async def _open_tcp_for_session(
                 raise HTTPException(status_code=400, detail="invalid VLESS header")
             return False
 
+        # همان لایه‌ی آی‌پی خروجی که WS استفاده می‌کند: ProxyIP یا پروکسی زنجیره‌ای.
         try:
             async with asyncio.timeout(TCP_CONNECT_TIMEOUT):
-                reader, writer = await open_upstream(address, port)
+                reader, writer, payload_sent = await open_outbound(
+                    address, port, payload, link=LINKS.get(uuid), uuid=uuid
+                )
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail="upstream connect timeout") from exc
         tune_upstream_socket(writer, FLOW_START_HW)
@@ -461,7 +465,7 @@ async def _open_tcp_for_session(
         # Send the VLESS response prefix as its own chunk: no copy of the first
         # target payload is needed and the client gets an earlier first byte.
         await _queue_down(sess, b"\x00\x00")
-        if payload:
+        if payload and not payload_sent:
             writer.write(payload)
 
         sess["downlink_task"] = asyncio.create_task(

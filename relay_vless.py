@@ -33,6 +33,8 @@ from main import (
     now_ir,
 )
 from speed_limit import QuotaGate, throttle
+import outbound
+from outbound import open_outbound
 
 # ── Bulk data-plane tuning ───────────────────────────────────────────────────
 READ_MIN = 128 * 1024
@@ -538,6 +540,12 @@ def tune_upstream_socket(writer: asyncio.StreamWriter, high_water: int = WRITE_H
     _tune_socket(writer, high_water)
 
 
+# لایه‌ی «آی‌پی خروجی» (ProxyIP / پروکسی زنجیره‌ای) از همین کانکتور استفاده می‌کند،
+# پس اتصال به ProxyIP هم Happy-Eyeballs، حافظه‌ی مسیر و تیونینگ سوکت را می‌گیرد.
+outbound.set_dialer(_open_upstream)
+outbound.set_tuner(lambda writer: _tune_socket(writer, WRITE_HW_START))
+
+
 # ── VLESS header + accounting ────────────────────────────────────────────────
 def _parse_vless_header(chunk: bytes | bytearray | memoryview):
     view = memoryview(chunk)
@@ -883,9 +891,11 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             conn["bytes"] += header_bytes
         logger.info("WS [%s] -> %s:%d", conn_id, address, port)
 
-        reader, writer = await _open_upstream(address, port)
+        reader, writer, payload_sent = await open_outbound(
+            address, port, payload, link=link, uuid=uuid
+        )
         _tune_socket(writer, WRITE_HW_START)
-        if payload:
+        if payload and not payload_sent:
             writer.write(payload)
 
         upload = asyncio.create_task(

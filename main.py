@@ -26,6 +26,10 @@ import uvicorn
 import httpx
 import logging
 
+# لایه‌ی آی‌پی خروجی (ProxyIP / relay IP). این ماژول عمداً هیچ چیزی از main import
+# نمی‌کند، پس اینجا import کردنش حلقه‌ی circular درست نمی‌کند.
+import outbound
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("X4G")
 
@@ -88,6 +92,11 @@ async def load_state():
             SUBS.update(data.get("subs", {}))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
+            saved_outbound = data.get("outbound")
+            if isinstance(saved_outbound, dict) and saved_outbound:
+                # تنظیمات ذخیره‌شده‌ی پنل بر متغیرهای محیطی اولویت دارند.
+                outbound.configure(**saved_outbound)
+                logger.info("Outbound mode: %s", outbound.SETTINGS.get("mode"))
             logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
@@ -100,6 +109,7 @@ async def save_state():
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
                 "password_hash": AUTH["password_hash"],
+                "outbound": outbound.export_settings(),
                 "saved_at": datetime.now().isoformat(),
             }
             tmp = DATA_FILE.with_suffix(".tmp")
@@ -1077,7 +1087,7 @@ app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 from xhttp_siz10 import router as xhttp_router
 app.include_router(xhttp_router)
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════���══════════════════════════════════════════════════
 # ربات مدیریت تلگرام (اختیاری — فقط اگه TELEGRAM_BOT_TOKEN ست شده باشه فعال می‌شه)
 # ═══════════════���══════════════════════════════════════════════════════════════
 from telegram_bot import start_bot as _tg_start_bot, stop_bot as _tg_stop_bot
@@ -1231,7 +1241,7 @@ if __name__ == "__main__":
         _ws_protocol = "auto"
         logger.warning("WS turbo protocol unavailable: %s", _ws_import_error)
 
-    # سوکت listen را خودمان می‌سازیم تا بتوانیم بافرها و کنترل ازدحام را روی آن تنظیم کنیم؛
+    # سوک�� listen را خودمان می‌سازیم تا بتوانیم بافرها و کنترل ازدحام را روی آن تنظیم کنیم؛
     # هر اتصال WebSocket پذیرفته‌شده این تنظیمات را ارث می‌برد → مسیر دانلود به کلاینت پهن می‌شود.
     import socket as _socket
 

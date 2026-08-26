@@ -102,6 +102,10 @@ for key, value in {
     setattr(main_stub, key, value)
 sys.modules["main"] = main_stub
 
+# outbound is a real standalone module; make it importable for the bot.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 class FakeAsyncClient:
     pass
 

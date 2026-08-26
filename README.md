@@ -93,6 +93,23 @@
 | `STORE_PLANS_JSON` | کاتالوگ قیمت سفارشی به‌صورت JSON | پلن‌های پیش‌فرض |
 | `STORE_RECEIPT_TIMEOUT_HOURS` | مهلت ارسال رسید و رزرو کد تخفیف | `24` |
 | `RAILWAY_PUBLIC_DOMAIN` | دامنه عمومی سرویس؛ به‌صورت خودکار توسط Railway تنظیم می‌شود | `localhost` |
+| `OUTBOUND_MODE` | مد آی‌پی خروجی: `direct` / `proxyip` / `socks5` / `http` / `https` | `direct` |
+| `PROXYIP` | لیست ProxyIP (ریلی معکوس) برای تغییر آی‌پی خروجی | — |
+| `PROXY_CONCURRENT_DIAL` | تعداد دایال موازی روی کاندیدهای ProxyIP | `1` |
+| `PROXYIP_FALLBACK` | اگر `1` باشد، خرابی همه‌ی کاندیدها → اتصال مستقیم | `0` |
+| `SOCKS5` یا `OUTBOUND_PROXY` | پروکسی زنجیره‌ای، مثل `socks5://u:p@1.2.3.4:1080` | — |
+| `PROXY_GLOBAL` | اگر `1` باشد، پروکسی زنجیره‌ای برای همه‌ی مقصدها | `0` |
+| `GO2SOCKS5` | میزبان‌های اجباری پروکسی، مثل `*.ip111.cn,*google.com` | — |
+
+## 🌐 آی‌پی خروجی (ProxyIP / Relay IP)
+
+می‌توانی کاری کنی که سایت‌های مقصد به‌جای آی‌پی سرور، آی‌پی انتخابی خودت را ببینند
+(همان مکانیزم ProxyIP در `cmliu/edgetunnel`).
+
+- پنل وب: **Settings → Exit IP · ProxyIP**
+- ربات: `/admin` → **🌐 آی‌پی خروجی (ProxyIP)**
+
+راهنمای کامل فرمت‌ها، مدها و محدودیت‌ها: [PROXYIP-EXIT-IP.md](PROXYIP-EXIT-IP.md)
 
 ## ⚠️ نکته مهم
 

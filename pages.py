@@ -742,6 +742,26 @@ a,button,input,select,textarea{font-family:inherit}
 button,a,.chip,.nav-it,.proto-card,.tog{transition:background .18s ease,color .18s ease,border-color .18s ease,transform .18s ease,box-shadow .18s ease}
 button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:2px solid #189BAD;outline-offset:2px;border-radius:10px}
 
+/* ============ Exit IP / ProxyIP panel ============ */
+.ob-body{padding:18px;display:grid;gap:15px}
+.ob-field label{display:block;margin-bottom:6px;font-size:13px;font-weight:600;opacity:.85}
+.ob-field input,.ob-field select,.ob-field textarea{width:100%;padding:11px 12px;border-radius:11px;border:1px solid rgba(191,191,191,.2);background:rgba(255,255,255,.04);color:inherit;font-size:13.5px;outline:none}
+.ob-field input:focus,.ob-field select:focus,.ob-field textarea:focus{border-color:rgba(24,155,173,.6);background:rgba(24,155,173,.06)}
+.ob-field textarea{resize:vertical;min-height:74px;line-height:1.6;direction:ltr;text-align:left}
+.ob-field input{direction:ltr;text-align:left}
+.ob-hint{margin-top:6px;font-size:11.5px;opacity:.62;line-height:1.65}
+.ob-hint code{background:rgba(191,191,191,.14);padding:1px 5px;border-radius:5px;font-size:11px;direction:ltr;display:inline-block}
+.ob-grid2{display:grid;grid-template-columns:1fr 1fr;gap:15px}
+.ob-check{display:flex;align-items:center;gap:9px;font-size:13px;opacity:.9;cursor:pointer}
+.ob-check input{width:16px;height:16px;accent-color:#189BAD;cursor:pointer}
+.ob-actions{display:flex;gap:10px;flex-wrap:wrap}
+.ob-actions .pw-submit{flex:1;min-width:150px}
+.ob-out{display:none;margin:0;padding:13px;border-radius:11px;background:rgba(0,0,0,.28);border:1px solid rgba(191,191,191,.16);font-size:11.5px;line-height:1.7;white-space:pre-wrap;word-break:break-all;direction:ltr;text-align:left;max-height:280px;overflow:auto}
+.ob-badge{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700}
+.ob-badge.on{background:rgba(29,168,106,.16);color:#4ade80}
+.ob-badge.off{background:rgba(191,191,191,.14);color:#BFBFBF}
+@media(max-width:640px){.ob-grid2{grid-template-columns:1fr}}
+
 body{font-size:14.5px}
 .logo-img,.mob-logo{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0D6A78,#791B0D);color:#fff;border-radius:13px;box-shadow:0 4px 14px rgba(13,106,120,.35);border:none}
 .logo-img{width:40px;height:40px;font-size:20px}
@@ -1396,6 +1416,63 @@ body{font-size:14.5px}
       </div>
     </div>
   </div>
+
+  <div class="srv-panel" style="margin-top:18px">
+    <div class="srv-hero">
+      <div class="srv-hero-icon"><i class="ti ti-route-alt-left"></i></div>
+      <div class="srv-hero-text">
+        <div class="srv-hero-domain">Exit IP &middot; ProxyIP</div>
+        <div class="srv-hero-sub" id="ob-state">آی‌پی‌ای که سایت‌های مقصد می‌بینند</div>
+      </div>
+    </div>
+    <div class="ob-body">
+      <div class="ob-field">
+        <label>مد خروجی</label>
+        <select id="ob-mode" onchange="obSyncMode()">
+          <option value="direct">Direct — اتصال مستقیم سرور (پیش‌فرض)</option>
+          <option value="proxyip">ProxyIP — ریلی معکوس (روش edgetunnel)</option>
+          <option value="socks5">SOCKS5 — پروکسی زنجیره‌ای</option>
+          <option value="http">HTTP CONNECT</option>
+          <option value="https">HTTPS CONNECT</option>
+        </select>
+        <div class="ob-hint" id="ob-mode-hint"></div>
+      </div>
+
+      <div class="ob-field" id="ob-row-proxyip">
+        <label>لیست ProxyIP</label>
+        <textarea id="ob-proxyip" rows="3" placeholder="proxyip.example.com:443, 1.2.3.4, [2606:4700::1]:2053, ts.example.com.tp8443"></textarea>
+        <div class="ob-hint">پورت پیش‌فرض 443 &middot; پشتیبانی از <code>host:port</code>، <code>[IPv6]:port</code>، پسوند <code>.tpNNNN</code> و رکورد TXT. با کاما یا خط جدید جدا کنید (حداکثر 8 کاندید انتخاب می‌شود).</div>
+      </div>
+
+      <div class="ob-field" id="ob-row-proxyurl">
+        <label>آدرس پروکسی زنجیره‌ای</label>
+        <input id="ob-proxyurl" placeholder="socks5://user:pass@1.2.3.4:1080">
+        <div class="ob-hint">رمز ذخیره‌شده در نمایش ماسک می‌شود؛ برای تغییر، مقدار کامل را دوباره وارد کنید.</div>
+      </div>
+
+      <div class="ob-grid2">
+        <div class="ob-field">
+          <label>دایال موازی (PROXY_CONCURRENT_DIAL)</label>
+          <input id="ob-conc" type="number" min="1" max="16" value="1">
+          <div class="ob-hint">بالاتر = اتصال سریع‌تر، اما تعویض آی‌پی خروجی مکررتر.</div>
+        </div>
+        <div class="ob-field">
+          <label>میزبان‌های اجباری (GO2SOCKS5)</label>
+          <input id="ob-force" placeholder="*.ip111.cn,*google.com یا *">
+          <div class="ob-hint">فقط برای مدهای پروکسی زنجیره‌ای. <code>*</code> = همه‌ی مقصدها.</div>
+        </div>
+      </div>
+
+      <label class="ob-check"><input type="checkbox" id="ob-fallback"> اگر همه‌ی کاندیدها خطا دادند، مستقیم وصل شو (fallback)</label>
+      <label class="ob-check"><input type="checkbox" id="ob-global"> پروکسی زنجیره‌ای برای همه‌ی مقصدها (global)</label>
+
+      <div class="ob-actions">
+        <button class="pw-submit" onclick="obSave()"><i class="ti ti-device-floppy"></i> ذخیره‌ی تنطیمات</button>
+        <button class="pw-submit" onclick="obTest()"><i class="ti ti-plug-connected"></i> تست اتصال</button>
+      </div>
+      <pre id="ob-out" class="ob-out"></pre>
+    </div>
+  </div>
 </section>
 <section class="pg" id="pg-support">
   <div class="topbar"><div><div class="tb-title"><i class="ti ti-headset"></i> Support</div></div></div>
@@ -1473,6 +1550,91 @@ async function authF(url,opts={}){
   if(r.status===401){location.href='/login';throw new Error('unauthorized')}
   return r;
 }
+
+/* ===== Exit IP / ProxyIP ===== */
+const OB_HINTS={
+  direct:'اتصال مستقیم از خود سرور. آی‌پی خروجی = آی‌پی سرور.',
+  proxyip:'به ریلی معکوس وصل می‌شود و بسته‌ی اول خام را می‌فرستد؛ سایت مقصد آی‌پی ProxyIP را می‌بیند. مناسب TLS روی 443 (مسیریابی با SNI).',
+  socks5:'آدرس واقعی مقصد به پروکسی اعلام می‌شود؛ برای هر پورت و هر پروتکلی کار می‌کند.',
+  http:'CONNECT روی پروکسی HTTP؛ برای هر پورتی کار می‌کند.',
+  https:'CONNECT روی پروکسی با TLS؛ برای هر پورتی کار می‌کند.'
+};
+let OB_LOADED_URL='';
+function obSyncMode(){
+  const m=document.getElementById('ob-mode').value;
+  document.getElementById('ob-mode-hint').textContent=OB_HINTS[m]||'';
+  document.getElementById('ob-row-proxyip').style.display=(m==='proxyip')?'':'none';
+  const chained=(m==='socks5'||m==='http'||m==='https');
+  document.getElementById('ob-row-proxyurl').style.display=chained?'':'none';
+}
+async function obLoad(){
+  try{
+    const r=await authF('/api/outbound');
+    const d=await r.json();
+    const s=d.settings||{};
+    document.getElementById('ob-mode').value=s.mode||'direct';
+    document.getElementById('ob-proxyip').value=s.proxyip||'';
+    OB_LOADED_URL=s.proxy_url||'';
+    document.getElementById('ob-proxyurl').value=OB_LOADED_URL;
+    document.getElementById('ob-conc').value=s.concurrency||1;
+    document.getElementById('ob-force').value=s.force_hosts||'';
+    document.getElementById('ob-fallback').checked=!!s.fallback;
+    document.getElementById('ob-global').checked=!!s.global_proxy;
+    const badge=d.active
+      ?'<span class="ob-badge on"><i class="ti ti-circle-check"></i> فعال</span>'
+      :'<span class="ob-badge off"><i class="ti ti-circle-minus"></i> مستقیم</span>';
+    let extra='';
+    if(s.pool_preview&&s.pool_preview.length){extra=' &nbsp;·&nbsp; '+s.pool_preview.length+' مقصد';}
+    document.getElementById('ob-state').innerHTML=badge+' &nbsp;مد: <b>'+(s.mode||'direct')+'</b>'+extra;
+    obSyncMode();
+  }catch(e){}
+}
+async function obSave(){
+  const mode=document.getElementById('ob-mode').value;
+  const body={
+    mode:mode,
+    proxyip:document.getElementById('ob-proxyip').value,
+    concurrency:parseInt(document.getElementById('ob-conc').value||'1',10),
+    force_hosts:document.getElementById('ob-force').value,
+    fallback:document.getElementById('ob-fallback').checked,
+    global_proxy:document.getElementById('ob-global').checked
+  };
+  const url=document.getElementById('ob-proxyurl').value;
+  // مقدار ماسک‌شده را دوباره نمی‌فرستیم تا رمز ذخیره‌شده خراب نشود.
+  if(url!==OB_LOADED_URL){body.proxy_url=url;}
+  try{
+    const r=await authF('/api/outbound',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!r.ok){toast(d.detail||'خطا در ذخیره','err');return;}
+    toast('تنطیمات آی‌پی خروجی ذخیره شد','ok');
+    await obLoad();
+  }catch(e){toast('خطا در ارتباط با سرور','err')}
+}
+async function obTest(){
+  const out=document.getElementById('ob-out');
+  out.style.display='block';
+  out.textContent='در حال تست...';
+  try{
+    const r=await authF('/api/outbound/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:'www.cloudflare.com'})});
+    const d=await r.json();
+    const res=(d&&d.result)||{};
+    const lines=[];
+    lines.push('mode      : '+(res.mode||'?'));
+    lines.push('target    : '+(res.target||'?'));
+    if(res.proxy){lines.push('proxy     : '+res.proxy);}
+    lines.push('candidates: '+(res.pool_size||0));
+    if(res.error){lines.push('error     : '+res.error);}
+    (res.candidates||[]).forEach(function(c,i){
+      const tag=c.ok?('OK  '+(c.ms!=null?(c.ms+' ms'):'')):('FAIL '+(c.error||''));
+      lines.push('  ['+(i+1)+'] '+c.endpoint+'  ->  '+tag);
+    });
+    const okCount=(res.candidates||[]).filter(function(c){return c.ok}).length;
+    lines.push('');
+    lines.push('reachable : '+okCount+' / '+((res.candidates||[]).length));
+    out.textContent=lines.join('\n');
+  }catch(e){out.textContent='خطا در اجرای تست'}
+}
+obLoad();
 function setQuota(val,unit,el){
   document.getElementById('nl-val').value = val===0?'':val;
   document.getElementById('nl-unit').value = unit;

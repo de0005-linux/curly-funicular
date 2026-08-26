@@ -29,6 +29,7 @@ from main import (
     set_link_sub,
     vless_link_for_link,
 )
+import outbound
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 _admin_ids_raw = os.environ.get("TELEGRAM_ADMIN_IDS", "").strip()
@@ -444,10 +445,70 @@ def _admin_kb():
         [{"text": "🎁 ساخت کد هدیه", "callback_data": "agift"},
          {"text": "🏷 ساخت کد تخفیف", "callback_data": "apromo"}],
         [{"text": "💳 تنظیم کارت بانکی", "callback_data": "acard"}],
+        [{"text": "🌐 آی‌پی خروجی (ProxyIP)", "callback_data": "aout"}],
         [{"text": "📋 مشاهده پلن‌ها", "callback_data": "aplans"},
          {"text": "📊 آمار فروشگاه", "callback_data": "astats"}],
         [{"text": "⬅ منوی کاربران", "callback_data": "menu"}],
     ]}
+
+
+OUT_MODE_LABELS = {
+    "direct": "مستقیم (آی‌پی خود سرور)",
+    "proxyip": "ProxyIP — ریلی معکوس",
+    "socks5": "SOCKS5 زنجیره‌ای",
+    "http": "HTTP CONNECT",
+    "https": "HTTPS CONNECT",
+}
+
+
+def _outbound_kb():
+    settings = outbound.export_settings()
+    mode = settings.get("mode", "direct")
+    rows = []
+    for key, label in OUT_MODE_LABELS.items():
+        mark = "● " if key == mode else "○ "
+        rows.append([{"text": mark + label, "callback_data": "aoutm:" + key}])
+    rows.append([{"text": "✏️ لیست ProxyIP", "callback_data": "aoutip"},
+                 {"text": "✏️ پروکسی", "callback_data": "aouturl"}])
+    fb = "✅" if settings.get("fallback") else "❌"
+    gl = "✅" if settings.get("global_proxy") else "❌"
+    rows.append([{"text": fb + " fallback", "callback_data": "aoutfb"},
+                 {"text": gl + " سراسری", "callback_data": "aoutgl"}])
+    rows.append([{"text": "🧪 تست اتصال", "callback_data": "aouttest"}])
+    rows.append([{"text": "⬅ پنل مدیریت", "callback_data": "admin"}])
+    return {"inline_keyboard": rows}
+
+
+def _outbound_text():
+    settings = outbound.settings_summary()
+    mode = settings.get("mode", "direct")
+    lines = [
+        "🌐 <b>آی‌پی خروجی</b>",
+        "",
+        "مد فعال: <b>" + html.escape(OUT_MODE_LABELS.get(mode, mode)) + "</b>",
+    ]
+    pool = settings.get("pool_preview") or []
+    if mode == "proxyip":
+        if pool:
+            lines.append("مقاصد (" + str(len(pool)) + "):")
+            for item in pool[:8]:
+                lines.append(" <code>" + html.escape(str(item)) + "</code>")
+        else:
+            lines.append("⚠️ لیست ProxyIP خالی است.")
+        lines.append("دایال موازی: <b>" + str(settings.get("concurrency", 1)) + "</b>")
+    elif mode in ("socks5", "http", "https"):
+        lines.append("پروکسی: <code>" + html.escape(str(settings.get("proxy_url") or "—")) + "</code>")
+        lines.append("میزبان اجباری: <code>" + html.escape(str(settings.get("force_hosts") or "—")) + "</code>")
+        if not settings.get("global_proxy"):
+            lines.append("⚠️ سراسری خاموش است؛ فقط میزبان‌های اجباری از پروکسی رد می‌شوند.")
+    else:
+        lines.append("سایت‌ها آی‌پی خود سرور را می‌بینند.")
+    lines.append("")
+    lines.append("fallback مستقیم: <b>" + ("روشن" if settings.get("fallback") else "خاموش") + "</b>")
+    lines.append("")
+    lines.append("ℹ️ ProxyIP با SNI مسیریابی می‌شود (مناسب HTTPS روی 443).")
+    lines.append("برای پورت‌های دیگر، مد SOCKS5 یا HTTP CONNECT را انتخاب کن.")
+    return "\n".join(lines)
 
 
 def _admin_review_kb(order_id: str):
@@ -969,6 +1030,43 @@ async def _handle_pending_text(chat_id: int, text: str, pending: dict):
         await _send(chat_id, "✅ اطلاعات کارت ذخیره شد.", _admin_kb())
         return True
 
+    if action == "outbound_proxyip" and _is_admin(chat_id):
+        raw = text.strip()
+        value = "" if raw in ("-", "حذف", "خالی") else raw
+        if value:
+            try:
+                pool = outbound.parse_endpoint_list(value)
+            except Exception:
+                pool = []
+            if not pool:
+                await _send(chat_id, "⚠️ هیچ مقصد معتبری پیدا نشد. دوباره بفرست یا /cancel را ارسال کن.")
+                return True
+        outbound.configure(proxyip=value)
+        await save_state()
+        _pending.pop(chat_id, None)
+        await _send(chat_id, _outbound_text(), _outbound_kb())
+        return True
+
+    if action == "outbound_proxyurl" and _is_admin(chat_id):
+        raw = text.strip()
+        value = "" if raw in ("-", "حذف", "خالی") else raw
+        if value:
+            mode = outbound.export_settings().get("mode", "socks5")
+            if mode not in ("socks5", "http", "https"):
+                mode = "socks5"
+            try:
+                parsed = outbound.parse_proxy_url(value, mode)
+            except Exception:
+                parsed = None
+            if not parsed or not parsed.get("hostname"):
+                await _send(chat_id, "⚠️ آدرس پروکسی معتبر نیست. دوباره بفرست یا /cancel را ارسال کن.")
+                return True
+        outbound.configure(proxy_url=value)
+        await save_state()
+        _pending.pop(chat_id, None)
+        await _send(chat_id, _outbound_text(), _outbound_kb())
+        return True
+
     if action and action.startswith("gift_admin_") and _is_admin(chat_id):
         return await _admin_gift_text(chat_id, text, pending)
     if action and action.startswith("promo_admin_") and _is_admin(chat_id):
@@ -1353,6 +1451,69 @@ async def _handle_callback(cb: dict):
         _pending[chat_id] = {"action": "promo_admin_value", "data": info}
         prompt = "درصد تخفیف (۱ تا ۱۰۰) را بفرست:" if typ == "percent" else "مبلغ ثابت تخفیف به تومان را بفرست:"
         await _edit(chat_id, message_id, prompt)
+        return
+    if data == "aout":
+        await _edit(chat_id, message_id, _outbound_text(), _outbound_kb())
+        return
+    if data.startswith("aoutm:"):
+        mode = data.split(":", 1)[1]
+        if mode not in OUT_MODE_LABELS:
+            await _answer(callback_id, "مد نامعتبر", True)
+            return
+        outbound.configure(mode=mode)
+        await save_state()
+        await _edit(chat_id, message_id, _outbound_text(), _outbound_kb())
+        await _answer(callback_id, "مد: " + mode)
+        return
+    if data == "aoutfb":
+        outbound.configure(fallback=not outbound.export_settings().get("fallback"))
+        await save_state()
+        await _edit(chat_id, message_id, _outbound_text(), _outbound_kb())
+        return
+    if data == "aoutgl":
+        outbound.configure(global_proxy=not outbound.export_settings().get("global_proxy"))
+        await save_state()
+        await _edit(chat_id, message_id, _outbound_text(), _outbound_kb())
+        return
+    if data == "aoutip":
+        _pending[chat_id] = {"action": "outbound_proxyip"}
+        await _edit(chat_id, message_id, (
+            "لیست ProxyIP را بفرست (با کاما یا خط جدید).\n"
+            "نمونه: <code>proxyip.example.com:443, 1.2.3.4, [2606:4700::1]:2053</code>\n"
+            "برای خالی کردن <code>-</code> و برای لغو /cancel را بفرست."
+        ))
+        return
+    if data == "aouturl":
+        _pending[chat_id] = {"action": "outbound_proxyurl"}
+        await _edit(chat_id, message_id, (
+            "آدرس پروکسی زنجیره‌ای را بفرست.\n"
+            "نمونه: <code>socks5://user:pass@1.2.3.4:1080</code>\n"
+            "برای خالی کردن <code>-</code> و برای لغو /cancel را بفرست."
+        ))
+        return
+    if data == "aouttest":
+        await _answer(callback_id, "در حال تست...")
+        try:
+            result = await outbound.probe()
+        except Exception as exc:
+            await _edit(chat_id, message_id, "❗️ تست ناموفق: <code>" + html.escape(str(exc)[:200]) + "</code>", _outbound_kb())
+            return
+        lines = [
+            "🧪 <b>نتیجه‌ی تست</b>",
+            "",
+            "مد: <b>" + html.escape(str(result.get("mode"))) + "</b>",
+            "مقصد: <code>" + html.escape(str(result.get("target"))) + "</code>",
+        ]
+        cands = result.get("candidates") or []
+        if not cands:
+            lines.append("کاندیدی برای تست وجود ندارد.")
+        for item in cands:
+            ep = html.escape(str(item.get("endpoint")))
+            if item.get("ok"):
+                lines.append("✅ <code>" + ep + "</code> — " + str(item.get("ms")) + " ms")
+            else:
+                lines.append("❌ <code>" + ep + "</code> — " + html.escape(str(item.get("error", ""))[:80]))
+        await _edit(chat_id, message_id, "\n".join(lines), _outbound_kb())
         return
     if data == "acard":
         _pending[chat_id] = {"action": "card_number"}
