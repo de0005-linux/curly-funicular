@@ -1625,10 +1625,26 @@ async function obTest(){
     lines.push('candidates: '+(res.pool_size||0));
     if(res.error){lines.push('error     : '+res.error);}
     (res.candidates||[]).forEach(function(c,i){
-      const tag=c.ok?('OK  '+(c.ms!=null?(c.ms+' ms'):'')):('FAIL '+(c.error||''));
+      var tag;
+      if(!c.ok){
+        tag='FAIL  '+(c.error||'');
+      }else if(c.relay_ok===false){
+        tag='TCP OK '+(c.ms!=null?('('+c.ms+' ms)'):'')+'  ->  RELAY FAIL: '+(c.relay_error||'no forward');
+      }else if(c.relay_ok===true){
+        tag='OK  '+(c.ms!=null?(c.ms+' ms'):'')+'  +  relay/TLS '+(c.tls_ms!=null?(c.tls_ms+' ms'):'');
+      }else{
+        tag='OK  '+(c.ms!=null?(c.ms+' ms'):'');
+      }
       lines.push('  ['+(i+1)+'] '+c.endpoint+'  ->  '+tag);
     });
-    const okCount=(res.candidates||[]).filter(function(c){return c.ok}).length;
+    const tcpCount=(res.candidates||[]).filter(function(c){return c.ok}).length;
+    const okCount=(res.candidates||[]).filter(function(c){return c.ok&&c.relay_ok!==false}).length;
+    if(tcpCount>0&&okCount===0){
+      lines.push('');
+      lines.push('⚠ پورت باز است ولی ریلی ترافیک را فوروارد نمی‌کند.');
+      lines.push('  این آی‌پی یک ProxyIP واقعی نیست → همه‌ی کانفیگ‌ها پینگ -1 می‌دهند.');
+      lines.push('  یا آی‌پی درست بذار، یا مد را SOCKS5 کن.');
+    }
     lines.push('');
     lines.push('reachable : '+okCount+' / '+((res.candidates||[]).length));
     out.textContent=lines.join('\n');

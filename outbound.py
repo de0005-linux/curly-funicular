@@ -65,6 +65,14 @@ DIAL_TIMEOUT = 10.0
 HANDSHAKE_TIMEOUT = 10.0
 CONNECT_HEADER_MAX = 8 * 1024
 
+# ریلی‌ای که TCP را می‌پذیرد ولی ترافیک را فوروارد نمی‌کند
+# باعث پینگ -1 می‌شود؛ پس منتظر اولین بایت پاسخ می‌مانیم. صفر = خاموش.
+try:
+    FIRST_BYTE_TIMEOUT = max(0.0, float(os.environ.get("PROXYIP_VERIFY_TIMEOUT", "6") or 6))
+except Exception:
+    FIRST_BYTE_TIMEOUT = 6.0
+PROBE_TLS_TIMEOUT = 8.0
+
 _DOH_ENDPOINTS = (
     "https:" + "//1.1.1.1/dns-query",
     "https:" + "//dns.google/resolve",
@@ -656,6 +664,57 @@ async def _race_dial(candidates: list[tuple[str, int]]):
     return winner
 
 
+def _looks_like_tls_client_hello(data: Any) -> bool:
+    """فقط برای ClientHello اعتبارسنجی می‌کنیم.
+
+    در پروتکل‌هایی که اول سرور صحبت می‌کند، انتظار برای
+    اولین بایت می‌تواند اشتباهاً اتصال سالم را خراب کند.
+    """
+    if not data:
+        return False
+    head = bytes(data[:3])
+    return len(head) >= 3 and head[0] == 0x16 and head[1] == 0x03
+
+
+class _PrefixReader:
+    """StreamReader با چند بایت پیش‌خوانده‌شده در ابتدا."""
+
+    def __init__(self, reader: asyncio.StreamReader, prefix: bytes):
+        self._reader = reader
+        self._prefix = bytes(prefix)
+
+    def __getattr__(self, name):
+        return getattr(self._reader, name)
+
+    async def read(self, n: int = -1) -> bytes:
+        if self._prefix:
+            if n is None or n < 0 or n >= len(self._prefix):
+                out, self._prefix = self._prefix, b""
+                return out
+            out, self._prefix = self._prefix[:n], self._prefix[n:]
+            return out
+        return await self._reader.read(n)
+
+    def at_eof(self) -> bool:
+        return (not self._prefix) and self._reader.at_eof()
+
+
+async def _verify_relay(reader: asyncio.StreamReader, timeout: float):
+    """مطمئن می‌شویم ریلی واقعاً ترافیک را فوروارد می‌کند.
+
+    موفقیت TCP کافی نیست؛ باید داده‌ی واقعی برگردد. بایت‌های
+    خوانده‌شده به بافر برمی‌گردند تا جریان دست نخورد.
+    """
+    chunk = await asyncio.wait_for(reader.read(65536), timeout=timeout)
+    if not chunk:
+        raise OSError("relay accepted the connection but sent no data")
+    try:
+        reader.feed_data(chunk)
+        return reader
+    except Exception:
+        return _PrefixReader(reader, chunk)
+
+
 async def connect_proxyip(
     pool: list[tuple[str, int]],
     first_packet: bytes | bytearray | memoryview | None,
@@ -687,6 +746,8 @@ async def connect_proxyip(
             if first_packet:
                 writer.write(bytes(first_packet))
                 await writer.drain()
+                if FIRST_BYTE_TIMEOUT > 0 and _looks_like_tls_client_hello(first_packet):
+                    reader = await _verify_relay(reader, FIRST_BYTE_TIMEOUT)
             _pool_index = indices[candidates.index(chosen)] if chosen in candidates else 0
             logger.info(
                 "ProxyIP connected via %s:%d (pool=%d)", chosen[0], chosen[1], total
@@ -904,7 +965,11 @@ async def open_outbound(
             return reader, writer, False
 
     # mode == "proxyip" — روش اصلی مرجع
-    pool = await resolve_pool(effective.get("proxyip"), address, uuid)
+    try:
+        pool = await resolve_pool(effective.get("proxyip"), address, uuid)
+    except Exception as exc:
+        logger.warning("ProxyIP resolve failed: %s", exc)
+        pool = []
     if not pool:
         reader, writer = await _dial(address, port)
         _tune(writer)
@@ -924,6 +989,44 @@ async def open_outbound(
         reader, writer = await _dial(address, port)
         _tune(writer)
         return reader, writer, False
+
+
+async def _relay_check(host: str, port: int, target_host: str) -> dict:
+    """بررسی واقعی ریلی: اتصال TCP + دست‌دهی TLS با SNI مقصد.
+
+    اگر ریلی فقط پورت را باز کرده باشد ولی فوروارد نکند، relay_ok=False.
+    """
+    entry: dict = {}
+    started = time.monotonic()
+    writer = None
+    try:
+        async with asyncio.timeout(6.0):
+            _reader, writer = await _dial(host, port)
+        entry["ok"] = True
+        entry["ms"] = round((time.monotonic() - started) * 1000.0, 1)
+    except Exception as exc:
+        entry["ok"] = False
+        entry["error"] = str(exc) or exc.__class__.__name__
+        return entry
+
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        tls_started = time.monotonic()
+        async with asyncio.timeout(PROBE_TLS_TIMEOUT):
+            await writer.start_tls(context, server_hostname=target_host)
+        entry["relay_ok"] = True
+        entry["tls_ms"] = round((time.monotonic() - tls_started) * 1000.0, 1)
+    except Exception as exc:
+        entry["relay_ok"] = False
+        entry["relay_error"] = str(exc) or exc.__class__.__name__
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+    return entry
 
 
 async def probe(
@@ -966,7 +1069,7 @@ async def probe(
         pool = await resolve_pool(effective.get("proxyip"), target_host, uuid)
         result["pool_size"] = len(pool)
         for host, port in pool:
-            entry = await _timed(lambda h=host, p=port: _dial(h, p))
+            entry = await _relay_check(host, port, target_host)
             entry["endpoint"] = host + ":" + str(port)
             result["candidates"].append(entry)
         return result
